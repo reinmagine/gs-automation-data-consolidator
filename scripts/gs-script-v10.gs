@@ -1,6 +1,6 @@
 // GR Template Consolidation
 
-// Config
+// CONFIG
 const CONFIG = {
   sourceFolderName: "GR template with Matdoc Reference: (File responses)",
   tempFolderName: "_GR_AUTOMATION_TEMP",
@@ -16,18 +16,23 @@ const CONFIG = {
   ],
   usdConversionRate: 57,
   triggerMinutes: 1,
-  maxFilesPerRunTotal: 16,
-  maxFilesPerRunPerYear: 8,
-  maxRuntimeMs: 260000,
+  maxFilesPerRunTotal: 6,
+  maxFilesPerRunPerYear: 3,
+  maxRuntimeMs: 55000,
   headerScanMaxRows: 80,
-  openRetryAttempts: 8,
-  openRetryDelayMs: 1500,
+  maxRowsPerSheetScan: 2500,
+  maxColsPerSheetScan: 45,
+  preferDirectTemplateTabFastPath: true,
+  useNumberFormatCurrencyHints: false,
+  openRetryAttempts: 3,
+  openRetryDelayMs: 500,
   minHeaderMatches: 3,
   maxFailedAttemptsPerFile: 5,
+  onlyIncludeVisibleRows: true,
   doneStatusText: "Done",
 };
 
-// Output columns
+// OUTPUT COLUMNS
 const COLUMN_MAPPING = [
   "Acceptance Date (PAC/FAC)",
   "PO No.",
@@ -54,7 +59,7 @@ const COLUMN_MAPPING = [
   "Payment Milestone",
 ];
 
-// Header aliases for flexible matching
+// HEADER ALIASES
 const HEADER_ALIASES = {
   "Acceptance Date (PAC/FAC)": [
     "acceptance date (pac/fac)",
@@ -126,7 +131,7 @@ const HEADER_ALIASES = {
   "Payment Milestone": ["payment milestone", "milestone"],
 };
 
-// Summary/footer keywords to exclude
+// SUMMARY KEYWORDS
 const SUMMARY_KEYWORDS = [
   "grand total",
   "sub-total",
@@ -144,7 +149,7 @@ const SUMMARY_KEYWORDS = [
   "remarks:",
 ];
 
-// Menu actions
+// MENU ACTIONS
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("GR Automation")
@@ -168,7 +173,7 @@ function onOpen() {
     .addToUi();
 }
 
-// Trigger setup and stop
+// TRIGGER SETUP AND CONTROL
 function setupAutomaticEvery1Min() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) {
@@ -213,7 +218,7 @@ function stopAutomatic() {
     ss.toast("Stopped. Removed " + count + " trigger(s).", "GR Automation", 8);
 }
 
-// Main consolidation run
+// MAIN CONSOLIDATION RUN
 function consolidateGRTemplateData() {
   const startTime = Date.now();
   const lock = LockService.getScriptLock();
@@ -221,12 +226,19 @@ function consolidateGRTemplateData() {
 
   if (!lock.tryLock(5000)) {
     Logger.log("Another run is already in progress.");
+    scriptProps.setProperty("LAST_RUN_STARTED_AT", new Date().toString());
+    scriptProps.setProperty("LAST_RUN_FINISHED_AT", new Date().toString());
     scriptProps.setProperty("LAST_RUN_STATUS", "Skipped: another run in progress");
+    scriptProps.setProperty("LAST_RUN_STAGE", "Waiting for current run to finish");
+    scriptProps.setProperty("LAST_RUN_ACTIVE_FILE", "");
+    scriptProps.setProperty("LAST_RUN_ACTIVE_YEAR", "");
     return;
   }
 
   try {
     scriptProps.setProperty("LAST_RUN_STARTED_AT", new Date().toString());
+    scriptProps.setProperty("LAST_RUN_STATUS", "Running");
+    scriptProps.setProperty("LAST_RUN_STAGE", "Preparing run");
 
     const ss = getSpreadsheet_();
     if (!ss) {
@@ -235,10 +247,12 @@ function consolidateGRTemplateData() {
         "LAST_RUN_STATUS",
         "Stopped: spreadsheet not found (run setup first)",
       );
+      scriptProps.setProperty("LAST_RUN_FINISHED_AT", new Date().toString());
       return;
     }
 
     ensureSheets_(ss);
+    scriptProps.setProperty("LAST_RUN_STAGE", "Scanning source folder");
 
     const sourceFolder = findFolder_(CONFIG.sourceFolderName);
     if (!sourceFolder) {
@@ -247,11 +261,9 @@ function consolidateGRTemplateData() {
         "LAST_RUN_STATUS",
         "Stopped: source folder not found",
       );
+      scriptProps.setProperty("LAST_RUN_FINISHED_AT", new Date().toString());
       return;
     }
-
-    // Remove any stale temp artifacts from previous interrupted runs.
-    cleanupStaleTempArtifacts_();
 
     const processedMap = loadProcessedMap_(ss);
     const failedAttemptsMap = loadFailedAttemptsMap_(ss);
@@ -276,7 +288,11 @@ function consolidateGRTemplateData() {
       Logger.log(
         "No new files to process. Trigger will check again next minute.",
       );
-      scriptProps.setProperty("LAST_RUN_STATUS", "No new files to process");
+      scriptProps.setProperty("LAST_RUN_STATUS", "Idle: no new files");
+      scriptProps.setProperty("LAST_RUN_STAGE", "Idle");
+      scriptProps.setProperty("LAST_RUN_ACTIVE_FILE", "");
+      scriptProps.setProperty("LAST_RUN_ACTIVE_YEAR", "");
+      scriptProps.setProperty("LAST_RUN_FINISHED_AT", new Date().toString());
       return;
     }
 
@@ -289,12 +305,43 @@ function consolidateGRTemplateData() {
     for (let i = 0; i < toProcess.length; i++) {
       if (Date.now() - startTime > CONFIG.maxRuntimeMs) {
         Logger.log("Stopped early due to runtime limit.");
+        scriptProps.setProperty(
+          "LAST_RUN_STATUS",
+          "Stopped early: runtime limit reached",
+        );
+        scriptProps.setProperty("LAST_RUN_STAGE", "Runtime limit reached");
         break;
       }
 
       const fileInfo = toProcess[i];
+      if (
+        processedMap[fileInfo.name] ||
+        processedMap[normalizeFileKey_(fileInfo.name)] ||
+        processedMap["__ID__" + fileInfo.id] ||
+        processedMap["__SOURCE_ID__" + fileInfo.id] ||
+        processedMap["__URL__" + normalizeDriveUrlForKey_(fileInfo.url)] ||
+        processedMap["__URL_ALT__" + String(fileInfo.url || "").replace(/^https?:\/\//, "").replace(/\?.*$/, "")]
+      ) {
+        Logger.log("Skipping already processed file: " + fileInfo.name);
+        continue;
+      }
+
+      scriptProps.setProperty("LAST_RUN_ACTIVE_FILE", fileInfo.name);
+      scriptProps.setProperty("LAST_RUN_ACTIVE_YEAR", fileInfo.year);
+      scriptProps.setProperty("LAST_RUN_STAGE", "Processing " + fileInfo.name);
+
       const result = processSingleFile_(ss, fileInfo, tempFolder);
       logToTracker_(ss, fileInfo, result);
+
+      if (String(result.status || "").toLowerCase() === "done") {
+        processedMap[fileInfo.name] = true;
+        processedMap[normalizeFileKey_(fileInfo.name)] = true;
+        processedMap["__ID__" + fileInfo.id] = true;
+        processedMap["__SOURCE_ID__" + fileInfo.id] = true;
+        const sourceUrl = String(fileInfo.url || "").trim();
+        processedMap["__URL__" + normalizeDriveUrlForKey_(sourceUrl)] = true;
+        processedMap["__URL_ALT__" + sourceUrl.replace(/^https?:\/\//, "").replace(/\?.*$/, "")] = true;
+      }
 
       processedCount++;
       totalRowsAdded += result.rowsAdded;
@@ -305,18 +352,23 @@ function consolidateGRTemplateData() {
     );
     scriptProps.setProperty(
       "LAST_RUN_STATUS",
-      "Processed files=" + processedCount + ", rows=" + totalRowsAdded,
+      "Done: files=" + processedCount + ", rows=" + totalRowsAdded,
     );
+    scriptProps.setProperty("LAST_RUN_STAGE", "Idle");
+    scriptProps.setProperty("LAST_RUN_ACTIVE_FILE", "");
+    scriptProps.setProperty("LAST_RUN_ACTIVE_YEAR", "");
+    scriptProps.setProperty("LAST_RUN_FINISHED_AT", new Date().toString());
   } catch (e) {
     Logger.log("Fatal error: " + e.message + "\n" + e.stack);
-    scriptProps.setProperty("LAST_RUN_STATUS", "Fatal error: " + e.message);
-  } finally {
+    scriptProps.setProperty("LAST_RUN_STATUS", "Error: " + e.message);
+    scriptProps.setProperty("LAST_RUN_STAGE", "Error");
     scriptProps.setProperty("LAST_RUN_FINISHED_AT", new Date().toString());
+  } finally {
     lock.releaseLock();
   }
 }
 
-// Spreadsheet helpers
+// SPREADSHEET HELPERS
 function normalizeLookupKey_(v) {
   return String(v || "")
     .replace(/\s+/g, "")
@@ -381,7 +433,6 @@ function parseAmount_(v) {
     s = s.substring(1, s.length - 1);
   }
 
-  // Reject non-monetary tokens
   var normalized = s.toLowerCase();
   normalized = normalized
     .replace(/us\s*dollars?/g, "")
@@ -663,7 +714,7 @@ function fillCurrencyFromHints_(outRow, rowFormats, columnMap) {
   }
 }
 
-// Folder and file discovery
+// FOLDER AND FILE DISCOVERY
 function findFolder_(name) {
   const iter = DriveApp.getFoldersByName(name);
   if (iter.hasNext()) return iter.next();
@@ -699,58 +750,12 @@ function detectYearFromNameOrFileDate_(file) {
     d = file.getDateCreated();
   } catch (e) {}
 
-  if (!(d instanceof Date)) {
-    try {
-      d = file.getLastUpdated();
-    } catch (e2) {}
-  }
-
   if (d instanceof Date) {
     const y = String(d.getFullYear());
     if (y === "2025" || y === "2026") return y;
   }
 
   return null;
-}
-
-function cleanupStaleTempArtifacts_() {
-  let cleaned = 0;
-
-  // Clean temp conversion folder
-  try {
-    const tempFolder = getOrCreateTempFolder_();
-    const tempFiles = tempFolder.getFiles();
-    while (tempFiles.hasNext()) {
-      const f = tempFiles.next();
-      const n = String(f.getName() || "");
-      if (!isTempArtifactName_(n)) continue;
-      try {
-        f.setTrashed(true);
-        cleaned++;
-      } catch (e) {}
-    }
-  } catch (e2) {}
-
-  // Also clean accidentally created temp files in source folder
-  try {
-    const sourceFolder = findFolder_(CONFIG.sourceFolderName);
-    if (sourceFolder) {
-      const srcFiles = sourceFolder.getFiles();
-      while (srcFiles.hasNext()) {
-        const f2 = srcFiles.next();
-        const n2 = String(f2.getName() || "");
-        if (!isTempArtifactName_(n2)) continue;
-        try {
-          f2.setTrashed(true);
-          cleaned++;
-        } catch (e3) {}
-      }
-    }
-  } catch (e4) {}
-
-  if (cleaned > 0) {
-    Logger.log("Auto-cleaned stale temp artifacts: " + cleaned);
-  }
 }
 
 function listCandidateFilesByYear_(
@@ -760,26 +765,42 @@ function listCandidateFilesByYear_(
 ) {
   const candidates = { 2025: [], 2026: [] };
   const files = sourceFolder.getFiles();
+  const max25 = CONFIG.maxFilesPerRunPerYear;
+  const max26 = CONFIG.maxFilesPerRunPerYear;
+  const maxTotal = CONFIG.maxFilesPerRunTotal;
 
   while (files.hasNext()) {
+    if (candidates["2025"].length + candidates["2026"].length >= maxTotal)
+      break;
+
     const f = files.next();
     const name = f.getName();
+    const fileId = f.getId();
+    const fileUrl = f.getUrl();
     const lower = name.toLowerCase();
 
     if (isTempArtifactName_(name)) continue;
     if (processedMap[name]) continue;
+    if (processedMap[normalizeFileKey_(name)]) continue;
+    if (processedMap["__ID__" + fileId]) continue;
+    if (processedMap["__URL__" + normalizeDriveUrlForKey_(fileUrl)]) continue;
     if ((failedAttemptsMap[name] || 0) >= CONFIG.maxFailedAttemptsPerFile)
       continue;
     if (lower.indexOf(".xlsx") === -1 && lower.indexOf(".xls") === -1) continue;
 
-    let year = detectYearFromNameOrFileDate_(f);
+    let year = null;
+    if (name.indexOf("2025") !== -1) year = "2025";
+    else if (name.indexOf("2026") !== -1) year = "2026";
     if (!year) continue;
 
+    if (year === "2025" && candidates["2025"].length >= max25) continue;
+    if (year === "2026" && candidates["2026"].length >= max26) continue;
+
     candidates[year].push({
-      id: f.getId(),
+      id: fileId,
       name: name,
       year: year,
-      url: f.getUrl(),
+      url: fileUrl,
     });
   }
 
@@ -802,21 +823,35 @@ function buildProcessList_(candidates) {
   return out;
 }
 
-// Tracker state maps
+// TRACKER STATE MAPS
 function loadProcessedMap_(ss) {
   const tracker = ss.getSheetByName(CONFIG.trackerSheetName);
   if (!tracker || tracker.getLastRow() <= 1) return {};
 
   const map = {};
-  const data = tracker.getRange(2, 1, tracker.getLastRow() - 1, 5).getValues();
+  const data = tracker.getRange(2, 1, tracker.getLastRow() - 1, 6).getValues();
 
   data.forEach(function (row) {
     const fileName = String(row[1] || "").trim();
     const status = String(row[4] || "")
       .trim()
       .toLowerCase();
-    if (fileName && (status === "ok" || status === "done"))
+    const fileUrl = String(row[5] || "").trim();
+    if (fileName && (status === "ok" || status === "done")) {
       map[fileName] = true;
+      map[normalizeFileKey_(fileName)] = true;
+    }
+
+    if (status === "ok" || status === "done") {
+      const idFromUrl = extractDriveIdFromUrl_(fileUrl);
+      if (idFromUrl) {
+        map["__ID__" + idFromUrl] = true;
+        map["__SOURCE_ID__" + idFromUrl] = true;
+      }
+      const urlKey = normalizeDriveUrlForKey_(fileUrl);
+      map["__URL__" + urlKey] = true;
+      map["__URL_ALT__" + String(fileUrl || "").replace(/^https?:\/\//, "").replace(/\?.*$/, "")] = true;
+    }
   });
 
   return map;
@@ -853,7 +888,7 @@ function loadFailedAttemptsMap_(ss) {
   return map;
 }
 
-// File conversion and single-file processing
+// FILE CONVERSION AND PROCESSING
 function processSingleFile_(ss, fileInfo, tempFolder) {
   let tempFileId = null;
 
@@ -909,7 +944,6 @@ function convertExcelToTempSheet_(fileInfo, tempFolder) {
       supportsAllDrives: true,
     });
 
-    // Defensive move in case Drive created file in a different parent.
     try {
       const createdFile = DriveApp.getFileById(copied.id);
       createdFile.moveTo(tempFolder);
@@ -948,13 +982,14 @@ function openSpreadsheetWithRetry_(fileId, attempts, delayMs) {
   );
 }
 
-// Sheet parsing and header mapping
+// SHEET PARSING AND HEADER MAPPING
 function parseConvertedSheet_(tempSS, fileName) {
   const preferredCandidates = [];
   const fallbackCandidates = [];
+  const directPreferredCandidates = [];
+  const directFallbackCandidates = [];
   const seenNames = {};
 
-  // Try likely GR template names first then compressed or conflicting column headers
   const directNames = [
     "GR TEMPLATE",
     "GR Template",
@@ -969,10 +1004,15 @@ function parseConvertedSheet_(tempSS, fileName) {
       const nm = sh.getName();
       if (seenNames[nm]) continue;
       seenNames[nm] = true;
-      const candidate = evaluateSheetCandidate_(sh);
+      const candidate = evaluateSheetCandidate_(sh, fileName, true);
       if (!candidate) continue;
-      if (candidate.preferred) preferredCandidates.push(candidate);
-      else fallbackCandidates.push(candidate);
+      if (candidate.preferred) {
+        preferredCandidates.push(candidate);
+        directPreferredCandidates.push(candidate);
+      } else {
+        fallbackCandidates.push(candidate);
+        directFallbackCandidates.push(candidate);
+      }
     } catch (e) {
       Logger.log(
         "Direct-name check failed for " +
@@ -984,7 +1024,14 @@ function parseConvertedSheet_(tempSS, fileName) {
     }
   }
 
-  // Fallback: iterate all sheets, but guard failures
+  if (CONFIG.preferDirectTemplateTabFastPath) {
+    const fastDirect = pickBestCandidate_(directPreferredCandidates) || pickBestCandidate_(directFallbackCandidates);
+    if (fastDirect && fastDirect.rows && fastDirect.rows.length > 0) {
+      Logger.log("Fast-path selected '" + fastDirect.sheetName + "' with " + fastDirect.rows.length + " row(s).");
+      return fastDirect.rows;
+    }
+  }
+
   try {
     const sheets = tempSS.getSheets();
     for (let i = 0; i < sheets.length; i++) {
@@ -998,10 +1045,9 @@ function parseConvertedSheet_(tempSS, fileName) {
       }
       if (seenNames[nm]) continue;
       seenNames[nm] = true;
-
       let candidate = null;
       try {
-        candidate = evaluateSheetCandidate_(sh);
+        candidate = evaluateSheetCandidate_(sh, fileName, false);
       } catch (eEval) {
         Logger.log(
           'Skipping sheet "' + nm + '" in parse loop (' + eEval.message + ")",
@@ -1023,6 +1069,12 @@ function parseConvertedSheet_(tempSS, fileName) {
     );
   }
 
+  const bestDirect = pickBestCandidate_(directPreferredCandidates) || pickBestCandidate_(directFallbackCandidates);
+  if (bestDirect && bestDirect.rows && bestDirect.rows.length > 0) {
+    Logger.log("Selected '" + bestDirect.sheetName + "' with " + bestDirect.rows.length + " row(s).");
+    return bestDirect.rows;
+  }
+
   const bestPreferred = pickBestCandidate_(preferredCandidates);
   const bestFallback = pickBestCandidate_(fallbackCandidates);
   const best = bestPreferred || bestFallback;
@@ -1031,34 +1083,29 @@ function parseConvertedSheet_(tempSS, fileName) {
     Logger.log("No extractable rows for " + fileName);
     return [];
   }
-
-  Logger.log(
-    "Selected '" + best.sheetName + "' with " + best.rows.length + " row(s).",
-  );
+  Logger.log("Selected '" + best.sheetName + "' with " + best.rows.length + " row(s).");
   return best.rows;
 }
 
-function evaluateSheetCandidate_(sh) {
+function evaluateSheetCandidate_(sh, fileName, isDirectName) {
   try {
     if (typeof sh.getType === "function") {
-      var sheetType = String(sh.getType());
-      if (sheetType !== "GRID") {
-        Logger.log(
-          "Skipping non-grid sheet '" + sh.getName() + "' type=" + sheetType,
-        );
-        return null;
-      }
+      const sheetType = String(sh.getType());
+      if (sheetType !== "GRID") return null;
     }
 
-    const lastRow = sh.getLastRow();
-    const lastCol = sh.getLastColumn();
+    const lastRow = Math.min(sh.getLastRow(), CONFIG.maxRowsPerSheetScan);
+    const lastCol = Math.min(sh.getLastColumn(), CONFIG.maxColsPerSheetScan);
     if (lastRow < 2 || lastCol < 3) return null;
 
-    let vals, disp, fmts;
+    let vals, disp;
+    let fmts = [];
     try {
       vals = sh.getRange(1, 1, lastRow, lastCol).getValues();
       disp = sh.getRange(1, 1, lastRow, lastCol).getDisplayValues();
-      fmts = sh.getRange(1, 1, lastRow, lastCol).getNumberFormats();
+      if (CONFIG.useNumberFormatCurrencyHints) {
+        fmts = sh.getRange(1, 1, lastRow, lastCol).getNumberFormats();
+      }
     } catch (e) {
       Logger.log('Skipping sheet "' + sh.getName() + '" (' + e.message + ")");
       return null;
@@ -1131,7 +1178,11 @@ function evaluateSheetCandidate_(sh) {
       h: h,
       sheetName: sh.getName(),
       preferred: isLikelyGRTemplateSheet_(sh.getName()),
-      score: h.matchedCount * 100 + Math.min(rows.length, 50),
+      score:
+        h.matchedCount * 100 +
+        Math.min(rows.length, 50) +
+        (isDirectName ? 1000 : 0) +
+        computePoHintMatchScore_(rows, fileName),
     };
   } catch (e) {
     Logger.log(
@@ -1139,6 +1190,50 @@ function evaluateSheetCandidate_(sh) {
     );
     return null;
   }
+}
+
+function normalizeFileKey_(name) {
+  return String(name || "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/\.[a-z0-9]{2,5}$/i, "")
+    .replace(/[^a-z0-9]+/g, "")
+    .trim();
+}
+
+function extractDriveIdFromUrl_(url) {
+  const m = String(url || "").match(/\/d\/([a-zA-Z0-9_-]+)/);
+  return m && m[1] ? m[1] : "";
+}
+
+function normalizeDriveUrlForKey_(url) {
+  const id = extractDriveIdFromUrl_(url);
+  if (id) return "id:" + id;
+  return String(url || "")
+    .replace(/\?.*$/, "")
+    .trim();
+}
+
+function extractPoHintFromFileName_(fileName) {
+  const s = String(fileName || "");
+  const m = s.match(/(45\d{8,})/);
+  return m && m[1] ? m[1] : "";
+}
+
+function computePoHintMatchScore_(rows, fileName) {
+  const poHint = extractPoHintFromFileName_(fileName);
+  if (!poHint || !rows || rows.length === 0) return 0;
+
+  let matchCount = 0;
+  const sampleSize = Math.min(rows.length, 50);
+  for (let i = 0; i < sampleSize; i++) {
+    const po = String(rows[i][1] || "").replace(/\D/g, ""); // PO No.
+    if (!po) continue;
+    if (po === poHint) matchCount++;
+  }
+
+  if (matchCount === 0) return -400;
+  return 200 + matchCount * 50;
 }
 
 function extractRowsWithFilter_(
@@ -1160,8 +1255,8 @@ function extractRowsWithFilter_(
   ];
 
   for (let r = headerRowIndex + 1; r < values.length; r++) {
-    const sheetRow = r + 1;
-    if (!isSheetRowVisible_(sheet, sheetRow)) continue;
+    if (CONFIG.onlyIncludeVisibleRows && !isSheetRowVisible_(sheet, r + 1))
+      continue;
 
     const rawRow = values[r];
     const dispRow = display[r] || [];
@@ -1327,7 +1422,7 @@ function createColumnMapping_(headerRow) {
   return { count: count, map: map };
 }
 
-// Row validation and extraction
+// ROW VALIDATION AND EXTRACTION
 function isCellPresent_(rawValue, displayValue) {
   if (
     String(displayValue || "")
@@ -1425,8 +1520,8 @@ function extractRowsByAnchors_(
   ];
 
   for (let r = headerRowIndex + 1; r < values.length; r++) {
-    const sheetRow = r + 1;
-    if (!isSheetRowVisible_(sheet, sheetRow)) continue;
+    if (CONFIG.onlyIncludeVisibleRows && !isSheetRowVisible_(sheet, r + 1))
+      continue;
 
     const rawRow = values[r];
     const dispRow = display[r] || [];
@@ -1530,7 +1625,7 @@ function isNonTrivialRow_(rawRow, dispRow) {
   return count >= 2;
 }
 
-// Cell formatting and sheet write
+// CELL FORMATTING AND SHEET WRITE
 function formatCellByHeader_(header, rawValue, displayValue) {
   if (header === "Payment Milestone") {
     if (typeof rawValue === "number" && rawValue > 0 && rawValue <= 1) {
@@ -1675,8 +1770,6 @@ function appendRowsWithSourceLink_(sheet, rows, fileInfo) {
   const colInfo = ensureEnrichmentColumns_(sheet);
 
   const enrich = rows.map(function (r) {
-    // r[14] Installed PLA ID, r[4] Material Description, r[5] PO Service Short Text
-    // r[20] Amount To Billed, r[21] Currency
     const key = normalizePlaLookupKey_(r[14]);
     const found = lookupMap[key];
 
@@ -1693,7 +1786,6 @@ function appendRowsWithSourceLink_(sheet, rows, fileInfo) {
       if (isManagedServices_(r[4], r[5])) {
         territory = "Managed Services";
       } else if (isOpexWbs_(r[10])) {
-        // WBS Element index in COLUMN_MAPPING
         territory = "OPEX";
       } else {
         territory = "N/A";
@@ -1788,18 +1880,34 @@ function convertAmountToUsdForAllData() {
   );
 }
 
-// Process log and maintenance
+// PROCESS LOG AND MAINTENANCE
 function logToTracker_(ss, fileInfo, result) {
   const tracker = ss.getSheetByName(CONFIG.trackerSheetName);
   if (!tracker) return;
-
+  const sourceUrl = String(fileInfo.url || "").trim();
+  const existingRows = tracker.getRange(2, 1, tracker.getLastRow() - 1, 6).getValues();
+  const fileName = String(fileInfo.name || "").trim();
+  const sourceFileId = extractDriveIdFromUrl_(sourceUrl);
+  const urlKey = normalizeDriveUrlForKey_(sourceUrl);
+  for (let i = 0; i < existingRows.length; i++) {
+    const row = existingRows[i];
+    const existingStatus = String(row[4] || "").trim().toLowerCase();
+    if (existingStatus !== String(result.status || "").trim().toLowerCase()) continue;
+    const existingFileId = extractDriveIdFromUrl_(String(row[5] || "").trim());
+    const existingUrlKey = normalizeDriveUrlForKey_(String(row[5] || "").trim());
+    if (String(row[1] || "").trim() === fileName || existingFileId === sourceFileId || existingUrlKey === urlKey) {
+      Logger.log("Skipping duplicate: " + fileName);
+      return;
+    }
+  }
+  
   tracker.appendRow([
     new Date(),
     fileInfo.name,
     fileInfo.year,
     result.rowsAdded,
     result.status,
-    fileInfo.url,
+    sourceUrl,
   ]);
 }
 
@@ -1947,7 +2055,7 @@ function cleanupTempFiles() {
   if (ss) ss.toast("Cleaned " + count + " temp file(s).", "GR Automation", 8);
 }
 
-// Notification helper
+// NOTIFICATION
 function notify_(message) {
   try {
     SpreadsheetApp.getUi().alert(message);
@@ -1956,7 +2064,7 @@ function notify_(message) {
   }
 }
 
-// Debug tools
+// DEBUG TOOLS
 function debugTestSingleFile() {
   const sourceFolder = findFolder_(CONFIG.sourceFolderName);
   if (!sourceFolder) {
@@ -2018,7 +2126,7 @@ function debugTestSingleFile() {
   }
 }
 
-// Diagnostic checking
+// DIAGNOSTIC CHECKING
 function debugMainSiteSetup() {
   const ss = getSpreadsheet_();
   if (!ss) {
@@ -2141,6 +2249,9 @@ function debugAutoProcessingStatus() {
     "Last run started: " + (scriptProps.getProperty("LAST_RUN_STARTED_AT") || "N/A"),
     "Last run finished: " + (scriptProps.getProperty("LAST_RUN_FINISHED_AT") || "N/A"),
     "Last run status: " + (scriptProps.getProperty("LAST_RUN_STATUS") || "N/A"),
+    "Last active file: " + (scriptProps.getProperty("LAST_RUN_ACTIVE_FILE") || "N/A"),
+    "Last active year: " + (scriptProps.getProperty("LAST_RUN_ACTIVE_YEAR") || "N/A"),
+    "Last stage: " + (scriptProps.getProperty("LAST_RUN_STAGE") || "N/A"),
     "Last candidate counts: " + (scriptProps.getProperty("LAST_RUN_CANDIDATES") || "N/A"),
     "",
     "Source folder stats",
