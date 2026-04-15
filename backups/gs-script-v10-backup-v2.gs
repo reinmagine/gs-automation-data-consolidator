@@ -1,6 +1,6 @@
 // GR Template Consolidation
 
-// Config
+// CONFIG
 const CONFIG = {
   sourceFolderName: "GR template with Matdoc Reference: (File responses)",
   tempFolderName: "_GR_AUTOMATION_TEMP",
@@ -18,10 +18,12 @@ const CONFIG = {
   triggerMinutes: 1,
   maxFilesPerRunTotal: 6,
   maxFilesPerRunPerYear: 3,
-  maxRuntimeMs: 55000,
+  maxRuntimeMs: 120000,
   headerScanMaxRows: 80,
   maxRowsPerSheetScan: 2500,
   maxColsPerSheetScan: 45,
+  preferDirectTemplateTabFastPath: true,
+  useNumberFormatCurrencyHints: false,
   openRetryAttempts: 3,
   openRetryDelayMs: 500,
   minHeaderMatches: 3,
@@ -30,7 +32,7 @@ const CONFIG = {
   doneStatusText: "Done",
 };
 
-// Output columns
+// OUTPUT COLUMNS
 const COLUMN_MAPPING = [
   "Acceptance Date (PAC/FAC)",
   "PO No.",
@@ -57,7 +59,104 @@ const COLUMN_MAPPING = [
   "Payment Milestone",
 ];
 
-// Header aliases for flexible matching
+// Derived column index map (0-based) for easy reference
+const COL = (function () {
+  const m = {};
+  for (var i = 0; i < COLUMN_MAPPING.length; i++) {
+    m[COLUMN_MAPPING[i]] = i;
+  }
+  return m;
+})();
+
+// Lightweight runtime cache to avoid repeated Spreadsheet reads during a run
+var _CACHE = {
+  configMappings: null,
+  plaLookupMapBySsId: {},
+};
+
+function getConfigMappingsCached_(force) {
+  if (!force && _CACHE.configMappings) return _CACHE.configMappings;
+  var m = readConfigMappings_();
+  _CACHE.configMappings = m || {};
+  return _CACHE.configMappings;
+}
+
+function clearConfigMappingsCache_() {
+  _CACHE.configMappings = null;
+}
+
+function getPlaLookupMapCached_(ss, force) {
+  if (!ss) return {};
+  var id = ss.getId ? ss.getId() : String(ss || "");
+  if (!force && _CACHE.plaLookupMapBySsId[id]) return _CACHE.plaLookupMapBySsId[id];
+  var m = loadPlaLookupMap_(ss);
+  _CACHE.plaLookupMapBySsId[id] = m || {};
+  return _CACHE.plaLookupMapBySsId[id];
+}
+
+function clearPlaLookupMapCache_(ss) {
+  if (!ss) {
+    _CACHE.plaLookupMapBySsId = {};
+    return;
+  }
+  var id = ss.getId ? ss.getId() : String(ss || "");
+  delete _CACHE.plaLookupMapBySsId[id];
+}
+
+function getConfiguredYears_() {
+  // Merge years from CONFIG.outputSheets and from the optional config sheet
+  const cfg = getConfigMappingsCached_();
+  const set = {};
+  Object.keys(CONFIG.outputSheets || {}).forEach(function (k) {
+    set[String(k)] = true;
+  });
+  Object.keys(cfg || {}).forEach(function (k) {
+    set[String(k)] = true;
+  });
+  return Object.keys(set).sort();
+}
+
+// Return enrichment [regional, cleanedSite, territory, usd] for a given outRow
+function getEnrichmentForRow_(row, lookupMap) {
+  var regional = "";
+  var cleaned = "";
+  var territory = "";
+
+  // If WBS indicates OPEX, short-circuit and skip PLA lookup
+  var wbsVal = row[COL["WBS Element"]];
+  if (isOpexWbs_(wbsVal)) {
+    territory = "OPEX";
+    var usdShort = toUsdIfPhp_(row[COL["Amount To Billed"]], row[COL["Currency"]]);
+    return [regional, cleaned, territory, usdShort];
+  }
+
+  // Prefer Installed PLA ID, then PO PLA ID
+  var installedKey = normalizePlaLookupKey_(row[COL["Installed PLA ID"]]);
+  var found = installedKey ? lookupMap[installedKey] : null;
+  if (!found) {
+    var poKey = normalizePlaLookupKey_(row[COL["PO PLA ID"]]);
+    if (poKey) found = lookupMap[poKey];
+  }
+
+  if (found) {
+    regional = found.regionalArea || "";
+    cleaned = found.cleanedSiteName || "";
+    territory = found.territory || "";
+  }
+
+  if (isMissingOrNaTerritory_(territory)) {
+    if (isManagedServices_(row[COL["Material Description"]], row[COL["PO Service Short Text"]])) {
+      territory = "Managed Services";
+    } else {
+      territory = "N/A";
+    }
+  }
+
+  var usd = toUsdIfPhp_(row[COL["Amount To Billed"]], row[COL["Currency"]]);
+  return [regional, cleaned, territory, usd];
+}
+
+// HEADER ALIASES
 const HEADER_ALIASES = {
   "Acceptance Date (PAC/FAC)": [
     "acceptance date (pac/fac)",
@@ -129,7 +228,7 @@ const HEADER_ALIASES = {
   "Payment Milestone": ["payment milestone", "milestone"],
 };
 
-// Summary/footer keywords to exclude
+// SUMMARY KEYWORDS
 const SUMMARY_KEYWORDS = [
   "grand total",
   "sub-total",
@@ -147,31 +246,69 @@ const SUMMARY_KEYWORDS = [
   "remarks:",
 ];
 
-// Menu actions
+// MENU ACTIONS
 function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu("GR Automation")
-    .addItem("Start Auto Processing (Every 1 min)", "setupAutomaticEvery1Min")
-    .addItem("Stop Auto Processing", "stopAutomatic")
-    .addSeparator()
-    .addItem("Process New Files Now", "consolidateGRTemplateData")
-    .addItem("Test One Source File (Debug)", "debugTestSingleFile")
-    .addSeparator()
+  const ui = SpreadsheetApp.getUi();
+  const main = ui.createMenu("GR Automation");
+
+  const processing = ui
+    .createMenu("Processing")
+    .addItem("Process All New Files Now", "consolidateGRTemplateData")
+    .addItem("Process Files for Year...", "showYearPicker")
+    .addItem("Retry Failed Files", "requeueNoDataFiles");
+
+  const posted = ui
+    .createMenu("GR Posted Sheets")
+    .addItem("Backfill Lookup & Territory (existing rows)", "repairMainSiteColumnsNow")
+    .addItem("Recompute USD for All Rows", "convertAmountToUsdForAllData")
+    .addItem("Fix Source File Hyperlinks", "fixSourceFileHyperlinksNow");
+
+  const logs = ui
+    .createMenu("Tracker & Logs")
+    .addItem("Fix Tracker File Links", "normalizeTrackerFileLinkColumnNow");
+
+  // backfill helpers
+  logs.addSeparator()
+    .addItem("Backfill Source Links (Preview)", "backfillMissingSourceLinksPreview")
+    .addItem("Backfill Source Links (Now)", "backfillMissingSourceLinksNow");
+
+  const automation = ui
+    .createMenu("Automation")
+    .addItem("Start Auto Trigger (1 min)", "setupAutomaticEvery1Min")
+    .addItem("Stop Auto Trigger", "stopAutomatic")
+    .addItem("Show Auto Processing Status", "debugAutoProcessingStatus");
+
+  const admin = ui
+    .createMenu("Admin")
     .addItem("Check Lookup & Output Setup", "debugMainSiteSetup")
-    .addItem("Check Auto Processing Status", "debugAutoProcessingStatus")
-    .addItem("Fill Lookup Fields (Existing Rows)", "repairMainSiteColumnsNow")
-    .addItem(
-      "Recompute USD Column (Existing Rows)",
-      "convertAmountToUsdForAllData",
-    )
-    .addSeparator()
-    .addItem("Retry Failed Files", "requeueNoDataFiles")
-    .addItem("Fix Tracker File Link URLs", "normalizeTrackerFileLinkColumnNow")
-    .addItem("Delete Temporary Converted Files", "cleanupTempFiles")
+    .addItem("Clean Temp Files", "cleanupTempFiles")
+    .addItem("Test One Source File (Debug)", "debugTestSingleFile");
+
+  main
+    .addSubMenu(processing)
+    .addSubMenu(posted)
+    .addSubMenu(logs)
+    .addSubMenu(automation)
+    .addSubMenu(admin)
     .addToUi();
 }
 
-// Trigger setup and stop
+
+function openPlaLookupSheet() {
+  const ss = getSpreadsheet_();
+  if (!ss) {
+    try { SpreadsheetApp.getUi().alert('No spreadsheet found.'); } catch (e) { }
+    return;
+  }
+  const sh = ss.getSheetByName(CONFIG.lookupSheetName);
+  if (!sh) {
+    try { SpreadsheetApp.getUi().alert('PLA Lookup sheet not found.'); } catch (e) { }
+    return;
+  }
+  ss.setActiveSheet(sh);
+}
+
+// TRIGGER SETUP AND CONTROL
 function setupAutomaticEvery1Min() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) {
@@ -216,7 +353,7 @@ function stopAutomatic() {
     ss.toast("Stopped. Removed " + count + " trigger(s).", "GR Automation", 8);
 }
 
-// Main consolidation run
+// MAIN CONSOLIDATION RUN
 function consolidateGRTemplateData() {
   const startTime = Date.now();
   const lock = LockService.getScriptLock();
@@ -226,14 +363,8 @@ function consolidateGRTemplateData() {
     Logger.log("Another run is already in progress.");
     scriptProps.setProperty("LAST_RUN_STARTED_AT", new Date().toString());
     scriptProps.setProperty("LAST_RUN_FINISHED_AT", new Date().toString());
-    scriptProps.setProperty(
-      "LAST_RUN_STATUS",
-      "Skipped: another run in progress",
-    );
-    scriptProps.setProperty(
-      "LAST_RUN_STAGE",
-      "Waiting for current run to finish",
-    );
+    scriptProps.setProperty("LAST_RUN_STATUS", "Skipped: another run in progress");
+    scriptProps.setProperty("LAST_RUN_STAGE", "Waiting for current run to finish");
     scriptProps.setProperty("LAST_RUN_ACTIVE_FILE", "");
     scriptProps.setProperty("LAST_RUN_ACTIVE_YEAR", "");
     return;
@@ -277,24 +408,21 @@ function consolidateGRTemplateData() {
       failedAttemptsMap,
     );
 
-    Logger.log(
-      "Candidates - 2025: " +
-        candidates["2025"].length +
-        ", 2026: " +
-        candidates["2026"].length,
-    );
-    scriptProps.setProperty(
-      "LAST_RUN_CANDIDATES",
-      "2025=" +
-        candidates["2025"].length +
-        ", 2026=" +
-        candidates["2026"].length,
-    );
+    const years = getConfiguredYears_();
+    const yearCounts = years
+      .map(function (y) {
+        return y + "=" + ((candidates[y] && candidates[y].length) || 0);
+      })
+      .join(", ");
+    Logger.log("Candidates - " + yearCounts);
+    scriptProps.setProperty("LAST_RUN_CANDIDATES", yearCounts);
 
-    if (candidates["2025"].length === 0 && candidates["2026"].length === 0) {
-      Logger.log(
-        "No new files to process. Trigger will check again next minute.",
-      );
+    let anyCandidates = false;
+    years.forEach(function (y) {
+      if (candidates[y] && candidates[y].length > 0) anyCandidates = true;
+    });
+    if (!anyCandidates) {
+      Logger.log("No new files to process. Trigger will check again next minute.");
       scriptProps.setProperty("LAST_RUN_STATUS", "Idle: no new files");
       scriptProps.setProperty("LAST_RUN_STAGE", "Idle");
       scriptProps.setProperty("LAST_RUN_ACTIVE_FILE", "");
@@ -321,12 +449,34 @@ function consolidateGRTemplateData() {
       }
 
       const fileInfo = toProcess[i];
+      if (
+        processedMap[fileInfo.name] ||
+        processedMap[normalizeFileKey_(fileInfo.name)] ||
+        processedMap["__ID__" + fileInfo.id] ||
+        processedMap["__SOURCE_ID__" + fileInfo.id] ||
+        processedMap["__URL__" + normalizeDriveUrlForKey_(fileInfo.url)] ||
+        processedMap["__URL_ALT__" + String(fileInfo.url || "").replace(/^https?:\/\//, "").replace(/\?.*$/, "")]
+      ) {
+        Logger.log("Skipping already processed file: " + fileInfo.name);
+        continue;
+      }
+
       scriptProps.setProperty("LAST_RUN_ACTIVE_FILE", fileInfo.name);
       scriptProps.setProperty("LAST_RUN_ACTIVE_YEAR", fileInfo.year);
       scriptProps.setProperty("LAST_RUN_STAGE", "Processing " + fileInfo.name);
 
       const result = processSingleFile_(ss, fileInfo, tempFolder);
-      logToTracker_(ss, fileInfo, result);
+      appendTrackerRowIfNotDuplicate_(ss, fileInfo, result, processedMap);
+
+      if (String(result.status || "").toLowerCase() === "done") {
+        processedMap[fileInfo.name] = true;
+        processedMap[normalizeFileKey_(fileInfo.name)] = true;
+        processedMap["__ID__" + fileInfo.id] = true;
+        processedMap["__SOURCE_ID__" + fileInfo.id] = true;
+        const sourceUrl = String(fileInfo.url || "").trim();
+        processedMap["__URL__" + normalizeDriveUrlForKey_(sourceUrl)] = true;
+        processedMap["__URL_ALT__" + sourceUrl.replace(/^https?:\/\//, "").replace(/\?.*$/, "")] = true;
+      }
 
       processedCount++;
       totalRowsAdded += result.rowsAdded;
@@ -353,7 +503,7 @@ function consolidateGRTemplateData() {
   }
 }
 
-// Spreadsheet helpers
+// SPREADSHEET HELPERS
 function normalizeLookupKey_(v) {
   return String(v || "")
     .replace(/\s+/g, "")
@@ -418,7 +568,6 @@ function parseAmount_(v) {
     s = s.substring(1, s.length - 1);
   }
 
-  // Reject non-monetary tokens
   var normalized = s.toLowerCase();
   normalized = normalized
     .replace(/us\s*dollars?/g, "")
@@ -532,7 +681,7 @@ function getSpreadsheet_() {
   try {
     const active = SpreadsheetApp.getActiveSpreadsheet();
     if (active) return active;
-  } catch (e) {}
+  } catch (e) { }
 
   const id = PropertiesService.getScriptProperties().getProperty(
     "BOUND_SPREADSHEET_ID",
@@ -547,17 +696,20 @@ function getSpreadsheet_() {
 }
 
 function ensureSheets_(ss) {
-  [
-    CONFIG.outputSheets["2025"],
-    CONFIG.outputSheets["2026"],
-    CONFIG.trackerSheetName,
-    CONFIG.lookupSheetName,
-  ].forEach(function (name) {
+  const years = getConfiguredYears_();
+  years.forEach(function (year) {
+    const name = getOutputSheetNameForYear(year);
     if (!ss.getSheetByName(name)) ss.insertSheet(name);
   });
 
-  ["2025", "2026"].forEach(function (year) {
-    const sh = ss.getSheetByName(CONFIG.outputSheets[year]);
+  // Ensure tracker and lookup sheets exist
+  [CONFIG.trackerSheetName, CONFIG.lookupSheetName].forEach(function (name) {
+    if (!ss.getSheetByName(name)) ss.insertSheet(name);
+  });
+
+  // Ensure headers/enrichment columns for each output sheet
+  years.forEach(function (year) {
+    const sh = ss.getSheetByName(getOutputSheetNameForYear(year));
     if (sh.getLastRow() === 0) {
       sh.appendRow(
         COLUMN_MAPPING.concat([CONFIG.sourceHeaderName]).concat(
@@ -565,6 +717,13 @@ function ensureSheets_(ss) {
         ),
       );
     } else {
+      // If sheet has data, ensure Source File header exists
+      const sourceCol = getColumnIndexByHeader_(sh, CONFIG.sourceHeaderName);
+      if (sourceCol < 1) {
+        // Add Source File header if missing
+        const lastCol = sh.getLastColumn();
+        sh.getRange(1, lastCol + 1).setValue(CONFIG.sourceHeaderName);
+      }
       ensureEnrichmentColumns_(sh);
     }
   });
@@ -640,6 +799,74 @@ function isOpexWbs_(wbsValue) {
   return w.indexOf("NT") === 0; // NT..., NT9-C, NT7-D9, etc.
 }
 
+// -- Config sheet helpers -------------------------------------------------
+function ensureConfigSheetExists_() {
+  const ss = getSpreadsheet_();
+  if (!ss) return null;
+  const name = 'GR Automation Config';
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.appendRow(['Year', 'Sheet Name', 'Spreadsheet ID']);
+  }
+  return sh;
+}
+
+function readConfigMappings_() {
+  const ss = getSpreadsheet_();
+  if (!ss) return {};
+  const sh = ss.getSheetByName('GR Automation Config');
+  if (!sh || sh.getLastRow() < 2) return {};
+  const data = sh.getRange(2, 1, sh.getLastRow() - 1, 3).getValues();
+  const map = {};
+  data.forEach(function (row) {
+    const y = String(row[0] || '').trim();
+    const sheetName = String(row[1] || '').trim();
+    const ssid = String(row[2] || '').trim();
+    if (!y) return;
+    map[y] = { sheetName: sheetName, spreadsheetId: ssid };
+  });
+  return map;
+}
+
+function writeConfigMapping_(year, sheetName, spreadsheetId) {
+  const ss = getSpreadsheet_();
+  if (!ss) return false;
+  const sh = ensureConfigSheetExists_();
+  const data = sh.getRange(2, 1, sh.getLastRow() - 1, 3).getValues();
+  for (var i = 0; i < data.length; i++) {
+    if (String(data[i][0] || '').trim() === String(year)) {
+      sh.getRange(2 + i, 2, 1, 2).setValues([[sheetName, spreadsheetId || '']]);
+      clearConfigMappingsCache_();
+      return true;
+    }
+  }
+  sh.appendRow([String(year), sheetName || '', spreadsheetId || '']);
+  clearConfigMappingsCache_();
+  return true;
+}
+
+function getOutputSheetNameForYear(year) {
+  const cfg = readConfigMappings_();
+  if (cfg[year] && cfg[year].sheetName) return cfg[year].sheetName;
+  if (CONFIG.outputSheets && CONFIG.outputSheets[year]) return CONFIG.outputSheets[year];
+  return 'GR Posted ' + year;
+}
+
+function addConfiguredYear(year, sheetName, spreadsheetId, createSheet) {
+  year = String(year || '').trim();
+  if (!/^[0-9]{4}$/.test(year)) return 'Invalid year format.';
+  sheetName = String(sheetName || ('GR Posted ' + year)).trim();
+  const ss = getSpreadsheet_();
+  if (!ss) return 'Bound spreadsheet not found.';
+  if (createSheet && !spreadsheetId) {
+    // create sheet in bound spreadsheet if not exists
+    if (!ss.getSheetByName(sheetName)) ss.insertSheet(sheetName);
+  }
+  writeConfigMapping_(year, sheetName, spreadsheetId || '');
+  return 'Year ' + year + ' added/updated.';
+}
+
 function fillCurrencyFromHints_(outRow, rowFormats, columnMap) {
   var cur = String(outRow[21] || "").trim();
   if (cur) return;
@@ -700,7 +927,7 @@ function fillCurrencyFromHints_(outRow, rowFormats, columnMap) {
   }
 }
 
-// Folder and file discovery
+// FOLDER AND FILE DISCOVERY
 function findFolder_(name) {
   const iter = DriveApp.getFoldersByName(name);
   if (iter.hasNext()) return iter.next();
@@ -720,76 +947,74 @@ function getOrCreateTempFolder_() {
 }
 
 function isTempArtifactName_(name) {
-  return (
-    String(name || "")
-      .toUpperCase()
-      .indexOf("_TEMP_") === 0
-  );
+  return String(name || "")
+    .toUpperCase()
+    .indexOf("_TEMP_") === 0;
 }
 
 function detectYearFromNameOrFileDate_(file) {
   const name = String(file.getName() || "");
+  const years = getConfiguredYears_();
 
-  if (name.indexOf("2025") !== -1) return "2025";
-  if (name.indexOf("2026") !== -1) return "2026";
+  for (var i = 0; i < years.length; i++) {
+    if (name.indexOf(years[i]) !== -1) return years[i];
+  }
 
   let d = null;
   try {
     d = file.getDateCreated();
-  } catch (e) {}
+  } catch (e) { }
 
   if (d instanceof Date) {
     const y = String(d.getFullYear());
-    if (y === "2025" || y === "2026") return y;
+    for (var j = 0; j < years.length; j++) {
+      if (y === years[j]) return years[j];
+    }
   }
 
   return null;
 }
 
-function listCandidateFilesByYear_(
-  sourceFolder,
-  processedMap,
-  failedAttemptsMap,
-) {
-  const candidates = { 2025: [], 2026: [] };
+function listCandidateFilesByYear_(sourceFolder, processedMap, failedAttemptsMap) {
+  const years = getConfiguredYears_();
+  const candidates = {};
+  years.forEach(function (y) {
+    candidates[y] = [];
+  });
+
   const files = sourceFolder.getFiles();
-  const max25 = CONFIG.maxFilesPerRunPerYear;
-  const max26 = CONFIG.maxFilesPerRunPerYear;
+  const maxPerYear = CONFIG.maxFilesPerRunPerYear;
+  const maxTotal = CONFIG.maxFilesPerRunTotal;
 
   while (files.hasNext()) {
-    // Stop scanning once we already have enough files for this run.
-    if (
-      candidates["2025"].length >= max25 &&
-      candidates["2026"].length >= max26
-    )
-      break;
+    // compute current total across years
+    var totalNow = 0;
+    for (var k in candidates) totalNow += candidates[k].length;
+    if (totalNow >= maxTotal) break;
 
     const f = files.next();
     const name = f.getName();
     const fileId = f.getId();
+    const fileUrl = f.getUrl();
     const lower = name.toLowerCase();
 
     if (isTempArtifactName_(name)) continue;
     if (processedMap[name]) continue;
     if (processedMap[normalizeFileKey_(name)]) continue;
     if (processedMap["__ID__" + fileId]) continue;
-    if ((failedAttemptsMap[name] || 0) >= CONFIG.maxFailedAttemptsPerFile)
-      continue;
+    if (processedMap["__URL__" + normalizeDriveUrlForKey_(fileUrl)]) continue;
+    if ((failedAttemptsMap[name] || 0) >= CONFIG.maxFailedAttemptsPerFile) continue;
     if (lower.indexOf(".xlsx") === -1 && lower.indexOf(".xls") === -1) continue;
 
-    let year = null;
-    if (name.indexOf("2025") !== -1) year = "2025";
-    else if (name.indexOf("2026") !== -1) year = "2026";
-    if (!year) continue;
-
-    if (year === "2025" && candidates["2025"].length >= max25) continue;
-    if (year === "2026" && candidates["2026"].length >= max26) continue;
+    const year = detectYearFromNameOrFileDate_(f);
+    if (!year || !candidates.hasOwnProperty(year)) continue;
+    if (candidates[year].length >= maxPerYear) continue;
 
     candidates[year].push({
       id: fileId,
       name: name,
       year: year,
-      url: f.getUrl(),
+      url: fileUrl,
     });
   }
 
@@ -797,22 +1022,30 @@ function listCandidateFilesByYear_(
 }
 
 function buildProcessList_(candidates) {
-  const y25 = candidates["2025"].slice(0, CONFIG.maxFilesPerRunPerYear);
-  const y26 = candidates["2026"].slice(0, CONFIG.maxFilesPerRunPerYear);
+  const years = getConfiguredYears_();
+  const perYearLists = years.map(function (y) {
+    return (candidates[y] || []).slice(0, CONFIG.maxFilesPerRunPerYear);
+  });
 
   const out = [];
-  const maxLen = Math.max(y25.length, y26.length);
-
-  for (let i = 0; i < maxLen && out.length < CONFIG.maxFilesPerRunTotal; i++) {
-    if (i < y25.length) out.push(y25[i]);
-    if (out.length < CONFIG.maxFilesPerRunTotal && i < y26.length)
-      out.push(y26[i]);
+  let idx = 0;
+  while (out.length < CONFIG.maxFilesPerRunTotal) {
+    let added = false;
+    for (let yi = 0; yi < perYearLists.length; yi++) {
+      if (perYearLists[yi][idx]) {
+        out.push(perYearLists[yi][idx]);
+        added = true;
+        if (out.length >= CONFIG.maxFilesPerRunTotal) break;
+      }
+    }
+    if (!added) break;
+    idx++;
   }
 
   return out;
 }
 
-// Tracker state maps
+// TRACKER STATE MAPS
 function loadProcessedMap_(ss) {
   const tracker = ss.getSheetByName(CONFIG.trackerSheetName);
   if (!tracker || tracker.getLastRow() <= 1) return {};
@@ -833,7 +1066,13 @@ function loadProcessedMap_(ss) {
 
     if (status === "ok" || status === "done") {
       const idFromUrl = extractDriveIdFromUrl_(fileUrl);
-      if (idFromUrl) map["__ID__" + idFromUrl] = true;
+      if (idFromUrl) {
+        map["__ID__" + idFromUrl] = true;
+        map["__SOURCE_ID__" + idFromUrl] = true;
+      }
+      const urlKey = normalizeDriveUrlForKey_(fileUrl);
+      map["__URL__" + urlKey] = true;
+      map["__URL_ALT__" + String(fileUrl || "").replace(/^https?:\/\//, "").replace(/\?.*$/, "")] = true;
     }
   });
 
@@ -871,45 +1110,73 @@ function loadFailedAttemptsMap_(ss) {
   return map;
 }
 
-// File conversion and single-file processing
+// FILE CONVERSION AND PROCESSING
 function processSingleFile_(ss, fileInfo, tempFolder) {
   let tempFileId = null;
+  const t0 = Date.now();
+  const timings = { convertMs: 0, openMs: 0, parseMs: 0, appendMs: 0, totalMs: 0 };
 
   try {
+    const tConvertStart = Date.now();
     tempFileId = convertExcelToTempSheet_(fileInfo, tempFolder);
+    timings.convertMs = Date.now() - tConvertStart;
 
+    const tOpenStart = Date.now();
     const tempSS = openSpreadsheetWithRetry_(
       tempFileId,
       CONFIG.openRetryAttempts,
       CONFIG.openRetryDelayMs,
     );
+    timings.openMs = Date.now() - tOpenStart;
 
+    const tParseStart = Date.now();
     const rows = parseConvertedSheet_(tempSS, fileInfo.name);
+    timings.parseMs = Date.now() - tParseStart;
 
     if (rows.length === 0) {
-      return { rowsAdded: 0, status: "No data extracted" };
+      timings.totalMs = Date.now() - t0;
+      timings.rowsAdded = 0;
+      timings.status = 'No data extracted';
+      return { rowsAdded: 0, status: "No data extracted", timings: timings };
     }
 
-    const outputSheet = ss.getSheetByName(CONFIG.outputSheets[fileInfo.year]);
-    appendRowsWithSourceLink_(outputSheet, rows, fileInfo);
+    const outputSheetName = getOutputSheetNameForYear(fileInfo.year);
+    let outputSheet = ss.getSheetByName(outputSheetName);
+    if (!outputSheet) {
+      outputSheet = ss.insertSheet(outputSheetName);
+      outputSheet.appendRow(COLUMN_MAPPING.concat([CONFIG.sourceHeaderName]).concat(CONFIG.enrichmentHeaders));
+    }
 
-    return { rowsAdded: rows.length, status: CONFIG.doneStatusText };
+    const tAppendStart = Date.now();
+    appendRowsWithSourceLink_(outputSheet, rows, fileInfo);
+    timings.appendMs = Date.now() - tAppendStart;
+
+    timings.totalMs = Date.now() - t0;
+    timings.rowsAdded = rows.length;
+    timings.status = CONFIG.doneStatusText;
+
+    return { rowsAdded: rows.length, status: CONFIG.doneStatusText, timings: timings };
   } catch (e) {
     const msg = e.message || "";
+    timings.totalMs = Date.now() - t0;
+    timings.rowsAdded = 0;
+    timings.status = 'Error: ' + (msg || String(e));
+
     if (
       msg.toLowerCase().indexOf("conversion of the uploaded content") !== -1
     ) {
       return {
         rowsAdded: 0,
         status: "Needs manual check - unsupported format",
+        timings: timings,
       };
     }
-    return { rowsAdded: 0, status: "Error: " + msg };
+    return { rowsAdded: 0, status: "Error: " + msg, timings: timings };
   } finally {
     if (tempFileId) {
       try {
         DriveApp.getFileById(tempFileId).setTrashed(true);
-      } catch (e2) {}
+      } catch (e2) { }
     }
   }
 }
@@ -927,11 +1194,10 @@ function convertExcelToTempSheet_(fileInfo, tempFolder) {
       supportsAllDrives: true,
     });
 
-    // Defensive move in case Drive created file in a different parent.
     try {
       const createdFile = DriveApp.getFileById(copied.id);
       createdFile.moveTo(tempFolder);
-    } catch (eMove) {}
+    } catch (eMove) { }
 
     return copied.id;
   } catch (e) {
@@ -942,7 +1208,7 @@ function convertExcelToTempSheet_(fileInfo, tempFolder) {
     try {
       const createdFallback = DriveApp.getFileById(copiedFallback.id);
       createdFallback.moveTo(tempFolder);
-    } catch (eMove2) {}
+    } catch (eMove2) { }
 
     return copiedFallback.id;
   }
@@ -962,11 +1228,11 @@ function openSpreadsheetWithRetry_(fileId, attempts, delayMs) {
 
   throw new Error(
     "Cannot open converted sheet after retries. " +
-      (lastErr ? lastErr.message : ""),
+    (lastErr ? lastErr.message : ""),
   );
 }
 
-// Sheet parsing and header mapping
+// SHEET PARSING AND HEADER MAPPING
 function parseConvertedSheet_(tempSS, fileName) {
   const preferredCandidates = [];
   const fallbackCandidates = [];
@@ -974,7 +1240,6 @@ function parseConvertedSheet_(tempSS, fileName) {
   const directFallbackCandidates = [];
   const seenNames = {};
 
-  // Try likely GR template names first then compressed or conflicting column headers
   const directNames = [
     "GR TEMPLATE",
     "GR Template",
@@ -1001,15 +1266,22 @@ function parseConvertedSheet_(tempSS, fileName) {
     } catch (e) {
       Logger.log(
         "Direct-name check failed for " +
-          directNames[i] +
-          " (" +
-          e.message +
-          ")",
+        directNames[i] +
+        " (" +
+        e.message +
+        ")",
       );
     }
   }
 
-  // Fallback: iterate all sheets, but guard failures
+  if (CONFIG.preferDirectTemplateTabFastPath) {
+    const fastDirect = pickBestCandidate_(directPreferredCandidates) || pickBestCandidate_(directFallbackCandidates);
+    if (fastDirect && fastDirect.rows && fastDirect.rows.length > 0) {
+      Logger.log("Fast-path selected '" + fastDirect.sheetName + "' with " + fastDirect.rows.length + " row(s).");
+      return fastDirect.rows;
+    }
+  }
+
   try {
     const sheets = tempSS.getSheets();
     for (let i = 0; i < sheets.length; i++) {
@@ -1023,7 +1295,6 @@ function parseConvertedSheet_(tempSS, fileName) {
       }
       if (seenNames[nm]) continue;
       seenNames[nm] = true;
-
       let candidate = null;
       try {
         candidate = evaluateSheetCandidate_(sh, fileName, false);
@@ -1041,27 +1312,17 @@ function parseConvertedSheet_(tempSS, fileName) {
   } catch (eSheets) {
     Logger.log(
       "Could not enumerate all sheets for " +
-        fileName +
-        " (" +
-        eSheets.message +
-        ")",
+      fileName +
+      " (" +
+      eSheets.message +
+      ")",
     );
   }
 
-  const bestDirectPreferred = pickBestCandidate_(directPreferredCandidates);
-  const bestDirectFallback = pickBestCandidate_(directFallbackCandidates);
-  if (bestDirectPreferred || bestDirectFallback) {
-    const bestDirect = bestDirectPreferred || bestDirectFallback;
-    if (bestDirect.rows && bestDirect.rows.length > 0) {
-      Logger.log(
-        "Selected direct-name tab '" +
-          bestDirect.sheetName +
-          "' with " +
-          bestDirect.rows.length +
-          " row(s).",
-      );
-      return bestDirect.rows;
-    }
+  const bestDirect = pickBestCandidate_(directPreferredCandidates) || pickBestCandidate_(directFallbackCandidates);
+  if (bestDirect && bestDirect.rows && bestDirect.rows.length > 0) {
+    Logger.log("Selected '" + bestDirect.sheetName + "' with " + bestDirect.rows.length + " row(s).");
+    return bestDirect.rows;
   }
 
   const bestPreferred = pickBestCandidate_(preferredCandidates);
@@ -1072,34 +1333,29 @@ function parseConvertedSheet_(tempSS, fileName) {
     Logger.log("No extractable rows for " + fileName);
     return [];
   }
-
-  Logger.log(
-    "Selected '" + best.sheetName + "' with " + best.rows.length + " row(s).",
-  );
+  Logger.log("Selected '" + best.sheetName + "' with " + best.rows.length + " row(s).");
   return best.rows;
 }
 
 function evaluateSheetCandidate_(sh, fileName, isDirectName) {
   try {
     if (typeof sh.getType === "function") {
-      var sheetType = String(sh.getType());
-      if (sheetType !== "GRID") {
-        Logger.log(
-          "Skipping non-grid sheet '" + sh.getName() + "' type=" + sheetType,
-        );
-        return null;
-      }
+      const sheetType = String(sh.getType());
+      if (sheetType !== "GRID") return null;
     }
 
     const lastRow = Math.min(sh.getLastRow(), CONFIG.maxRowsPerSheetScan);
     const lastCol = Math.min(sh.getLastColumn(), CONFIG.maxColsPerSheetScan);
     if (lastRow < 2 || lastCol < 3) return null;
 
-    let vals, disp, fmts;
+    let vals, disp;
+    let fmts = [];
     try {
       vals = sh.getRange(1, 1, lastRow, lastCol).getValues();
       disp = sh.getRange(1, 1, lastRow, lastCol).getDisplayValues();
-      fmts = sh.getRange(1, 1, lastRow, lastCol).getNumberFormats();
+      if (CONFIG.useNumberFormatCurrencyHints) {
+        fmts = sh.getRange(1, 1, lastRow, lastCol).getNumberFormats();
+      }
     } catch (e) {
       Logger.log('Skipping sheet "' + sh.getName() + '" (' + e.message + ")");
       return null;
@@ -1121,8 +1377,8 @@ function evaluateSheetCandidate_(sh, fileName, isDirectName) {
     if (!hasPoNo || keyHeaderCount < 3) {
       Logger.log(
         "Skipping non-GR-like sheet '" +
-          sh.getName() +
-          "' (missing key headers).",
+        sh.getName() +
+        "' (missing key headers).",
       );
       return null;
     }
@@ -1158,11 +1414,11 @@ function evaluateSheetCandidate_(sh, fileName, isDirectName) {
 
     Logger.log(
       "Sheet '" +
-        sh.getName() +
-        "' -> headers: " +
-        h.matchedCount +
-        ", rows: " +
-        rows.length,
+      sh.getName() +
+      "' -> headers: " +
+      h.matchedCount +
+      ", rows: " +
+      rows.length,
     );
 
     if (rows.length === 0) return null;
@@ -1188,14 +1444,24 @@ function evaluateSheetCandidate_(sh, fileName, isDirectName) {
 
 function normalizeFileKey_(name) {
   return String(name || "")
+    .normalize("NFKC")
     .toLowerCase()
-    .replace(/\s+/g, " ")
+    .replace(/\.[a-z0-9]{2,5}$/i, "")
+    .replace(/[^a-z0-9]+/g, "")
     .trim();
 }
 
 function extractDriveIdFromUrl_(url) {
   const m = String(url || "").match(/\/d\/([a-zA-Z0-9_-]+)/);
   return m && m[1] ? m[1] : "";
+}
+
+function normalizeDriveUrlForKey_(url) {
+  const id = extractDriveIdFromUrl_(url);
+  if (id) return "id:" + id;
+  return String(url || "")
+    .replace(/\?.*$/, "")
+    .trim();
 }
 
 function extractPoHintFromFileName_(fileName) {
@@ -1406,7 +1672,7 @@ function createColumnMapping_(headerRow) {
   return { count: count, map: map };
 }
 
-// Row validation and extraction
+// ROW VALIDATION AND EXTRACTION
 function isCellPresent_(rawValue, displayValue) {
   if (
     String(displayValue || "")
@@ -1575,13 +1841,13 @@ function isSheetRowVisible_(sheet, rowNumber) {
     if (typeof sheet.isRowHiddenByFilter === "function") {
       if (sheet.isRowHiddenByFilter(rowNumber)) return false;
     }
-  } catch (e) {}
+  } catch (e) { }
 
   try {
     if (typeof sheet.isRowHiddenByUser === "function") {
       if (sheet.isRowHiddenByUser(rowNumber)) return false;
     }
-  } catch (e2) {}
+  } catch (e2) { }
 
   return true;
 }
@@ -1609,7 +1875,7 @@ function isNonTrivialRow_(rawRow, dispRow) {
   return count >= 2;
 }
 
-// Cell formatting and sheet write
+// CELL FORMATTING AND SHEET WRITE
 function formatCellByHeader_(header, rawValue, displayValue) {
   if (header === "Payment Milestone") {
     if (typeof rawValue === "number" && rawValue > 0 && rawValue <= 1) {
@@ -1648,11 +1914,12 @@ function repairMainSiteColumnsNow() {
     return;
   }
 
-  const lookupMap = loadPlaLookupMap_(ss);
+  const lookupMap = getPlaLookupMapCached_(ss);
   let totalUpdated = 0;
   let details = [];
 
-  ["2025", "2026"].forEach(function (year) {
+  const years = getConfiguredYears_();
+  years.forEach(function (year) {
     const sh = findOutputSheetByYear_(ss, year);
     if (!sh) {
       details.push(year + ": target sheet not found");
@@ -1663,7 +1930,6 @@ function repairMainSiteColumnsNow() {
     const matCol = getColumnIndexByHeader_(sh, "Material Description");
     const svcCol = getColumnIndexByHeader_(sh, "PO Service Short Text");
     const amtCol = getColumnIndexByHeader_(sh, "Amount To Billed");
-    const subCol = getColumnIndexByHeader_(sh, "Sub Total");
     const curCol = getColumnIndexByHeader_(sh, "Currency");
     if (amtCol < 1 || curCol < 1) {
       details.push(year + ": Amount To Billed/Currency header not found");
@@ -1672,14 +1938,18 @@ function repairMainSiteColumnsNow() {
 
     const lastRow = sh.getLastRow();
     const rowCount = lastRow - 1;
+    if (rowCount <= 0) {
+      details.push(year + ": no data rows");
+      return;
+    }
 
     const wbsCol = getColumnIndexByHeader_(sh, "WBS Element");
     const wbsVals =
       wbsCol > 0 ? sh.getRange(2, wbsCol, rowCount, 1).getDisplayValues() : [];
 
-    const plaVals = sh.getRange(2, plaCol, rowCount, 1).getDisplayValues();
-    const matVals = sh.getRange(2, matCol, rowCount, 1).getDisplayValues();
-    const svcVals = sh.getRange(2, svcCol, rowCount, 1).getDisplayValues();
+    const plaVals = plaCol > 0 ? sh.getRange(2, plaCol, rowCount, 1).getDisplayValues() : [];
+    const matVals = matCol > 0 ? sh.getRange(2, matCol, rowCount, 1).getDisplayValues() : [];
+    const svcVals = svcCol > 0 ? sh.getRange(2, svcCol, rowCount, 1).getDisplayValues() : [];
     const amtVals = sh.getRange(2, amtCol, rowCount, 1).getDisplayValues();
     const curVals = sh.getRange(2, curCol, rowCount, 1).getDisplayValues();
 
@@ -1687,25 +1957,15 @@ function repairMainSiteColumnsNow() {
 
     const out = [];
     for (var i = 0; i < rowCount; i++) {
-      const key = normalizePlaLookupKey_(plaVals[i][0]);
-      const found = lookupMap[key];
+      var r = [];
+      r[COL["Installed PLA ID"]] = plaVals[i] ? plaVals[i][0] : "";
+      r[COL["WBS Element"]] = wbsVals.length ? wbsVals[i][0] : "";
+      r[COL["Material Description"]] = matVals[i] ? matVals[i][0] : "";
+      r[COL["PO Service Short Text"]] = svcVals[i] ? svcVals[i][0] : "";
+      r[COL["Amount To Billed"]] = amtVals[i] ? amtVals[i][0] : "";
+      r[COL["Currency"]] = curVals[i] ? curVals[i][0] : "";
 
-      var regional = found ? found.regionalArea || "" : "";
-      var cleaned = found ? found.cleanedSiteName || "" : "";
-      var territory = found ? found.territory || "" : "";
-
-      if (isMissingOrNaTerritory_(territory)) {
-        if (isManagedServices_(matVals[i][0], svcVals[i][0])) {
-          territory = "Managed Services";
-        } else if (isOpexWbs_(wbsVals.length ? wbsVals[i][0] : "")) {
-          territory = "OPEX";
-        } else {
-          territory = "N/A";
-        }
-      }
-
-      const usd = toUsdIfPhp_(amtVals[i][0], curVals[i][0]);
-      out.push([regional, cleaned, territory, usd]);
+      out.push(getEnrichmentForRow_(r, lookupMap));
     }
 
     sh.getRange(2, colInfo.regionalAreaCol, rowCount, 4).setValues(out);
@@ -1715,9 +1975,9 @@ function repairMainSiteColumnsNow() {
 
   notify_(
     "Lookup + USD update complete.\nTotal rows updated: " +
-      totalUpdated +
-      "\n\n" +
-      details.join("\n"),
+    totalUpdated +
+    "\n\n" +
+    details.join("\n"),
   );
 }
 
@@ -1750,37 +2010,11 @@ function appendRowsWithSourceLink_(sheet, rows, fileInfo) {
   }
 
   const ss = sheet.getParent();
-  const lookupMap = loadPlaLookupMap_(ss);
+  const lookupMap = getPlaLookupMapCached_(ss);
   const colInfo = ensureEnrichmentColumns_(sheet);
 
   const enrich = rows.map(function (r) {
-    // r[14] Installed PLA ID, r[4] Material Description, r[5] PO Service Short Text
-    // r[20] Amount To Billed, r[21] Currency
-    const key = normalizePlaLookupKey_(r[14]);
-    const found = lookupMap[key];
-
-    var regional = "";
-    var cleaned = "";
-    var territory = "";
-    if (found) {
-      regional = found.regionalArea || "";
-      cleaned = found.cleanedSiteName || "";
-      territory = found.territory || "";
-    }
-
-    if (isMissingOrNaTerritory_(territory)) {
-      if (isManagedServices_(r[4], r[5])) {
-        territory = "Managed Services";
-      } else if (isOpexWbs_(r[10])) {
-        // WBS Element index in COLUMN_MAPPING
-        territory = "OPEX";
-      } else {
-        territory = "N/A";
-      }
-    }
-
-    const usd = toUsdIfPhp_(r[20], r[21]);
-    return [regional, cleaned, territory, usd];
+    return getEnrichmentForRow_(r, lookupMap);
   });
 
   sheet
@@ -1794,7 +2028,7 @@ function convertAmountToUsdForAllData() {
   let total = 0;
   let notes = [];
 
-  ["2025", "2026"].forEach(function (year) {
+  getConfiguredYears_().forEach(function (year) {
     const sh = findOutputSheetByYear_(ss, year);
     if (!sh) {
       notes.push(year + ": target sheet not found");
@@ -1852,25 +2086,118 @@ function convertAmountToUsdForAllData() {
     total += rowCount;
     notes.push(
       year +
-        ": USD recomputed for " +
-        rowCount +
-        " row(s), Amount repaired: " +
-        repairedAmountCount,
+      ": USD recomputed for " +
+      rowCount +
+      " row(s), Amount repaired: " +
+      repairedAmountCount,
     );
   });
 
   notify_(
     "USD conversion done (rate = 57).\nTotal rows processed: " +
-      total +
-      "\n\n" +
-      notes.join("\n"),
+    total +
+    "\n\n" +
+    notes.join("\n"),
   );
 }
 
-// Process log and maintenance
+// Convert existing plain-text Source File values back to actual HYPERLINK formulas
+function fixSourceFileHyperlinksNow() {
+  const ss = getSpreadsheet_();
+  if (!ss) {
+    notify_("No spreadsheet found.");
+    return;
+  }
+
+  let totalFixed = 0;
+  let details = [];
+
+  getConfiguredYears_().forEach(function (year) {
+    const sh = findOutputSheetByYear_(ss, year);
+    if (!sh) {
+      details.push(year + ": target sheet not found");
+      return;
+    }
+
+    const sourceCol = getColumnIndexByHeader_(sh, CONFIG.sourceHeaderName);
+    if (sourceCol < 1) {
+      details.push(year + ": Source File column not found");
+      return;
+    }
+
+    const lastRow = sh.getLastRow();
+    if (lastRow < 2) {
+      details.push(year + ": no data rows");
+      return;
+    }
+
+    const rowCount = lastRow - 1;
+    const range = sh.getRange(2, sourceCol, rowCount, 1);
+    const values = range.getDisplayValues();
+    const formulas = range.getFormulas();
+
+    let fixed = 0;
+    const newFormulas = [];
+
+    for (let i = 0; i < values.length; i++) {
+      const cellValue = String(values[i][0] || "").trim();
+      const cellFormula = String(formulas[i][0] || "").trim();
+
+      // If already a formula, keep it
+      if (cellFormula && cellFormula.indexOf("=") === 0) {
+        newFormulas.push([cellFormula]);
+        continue;
+      }
+
+      // If value starts with =HYPERLINK, it's stored as text - convert to formula
+      if (cellValue.indexOf("=HYPERLINK") === 0) {
+        newFormulas.push([cellValue]);
+        fixed++;
+      } else if (cellValue) {
+        // Otherwise keep as-is (could be plain text)
+        newFormulas.push([cellValue]);
+      } else {
+        newFormulas.push([""]);
+      }
+    }
+
+    if (fixed > 0) {
+      range.setFormulas(newFormulas);
+      totalFixed += fixed;
+      details.push(year + ": converted " + fixed + " text hyperlink(s) to formula(s)");
+    } else {
+      details.push(year + ": no text hyperlinks found to convert");
+    }
+  });
+
+  notify_(
+    "Source File hyperlink conversion complete.\nTotal converted: " +
+    totalFixed +
+    "\n\n" +
+    details.join("\n"),
+  );
+}
+
+// PROCESS LOG AND MAINTENANCE
 function logToTracker_(ss, fileInfo, result) {
   const tracker = ss.getSheetByName(CONFIG.trackerSheetName);
   if (!tracker) return;
+  const sourceUrl = String(fileInfo.url || "").trim();
+  const existingRows = tracker.getRange(2, 1, tracker.getLastRow() - 1, 6).getValues();
+  const fileName = String(fileInfo.name || "").trim();
+  const sourceFileId = extractDriveIdFromUrl_(sourceUrl);
+  const urlKey = normalizeDriveUrlForKey_(sourceUrl);
+  for (let i = 0; i < existingRows.length; i++) {
+    const row = existingRows[i];
+    const existingStatus = String(row[4] || "").trim().toLowerCase();
+    if (existingStatus !== String(result.status || "").trim().toLowerCase()) continue;
+    const existingFileId = extractDriveIdFromUrl_(String(row[5] || "").trim());
+    const existingUrlKey = normalizeDriveUrlForKey_(String(row[5] || "").trim());
+    if (String(row[1] || "").trim() === fileName || existingFileId === sourceFileId || existingUrlKey === urlKey) {
+      Logger.log("Skipping duplicate: " + fileName);
+      return;
+    }
+  }
 
   tracker.appendRow([
     new Date(),
@@ -1878,9 +2205,73 @@ function logToTracker_(ss, fileInfo, result) {
     fileInfo.year,
     result.rowsAdded,
     result.status,
-    fileInfo.url,
+    sourceUrl,
   ]);
 }
+
+// Append tracker row using the in-memory processedMap to avoid scanning the whole tracker sheet
+function appendTrackerRowIfNotDuplicate_(ss, fileInfo, result, processedMap) {
+  try {
+    const fileName = String(fileInfo.name || '').trim();
+    const sourceUrl = String(fileInfo.url || '').trim();
+    if (processedMap) {
+      if (
+        processedMap[fileName] ||
+        processedMap[normalizeFileKey_(fileName)] ||
+        processedMap['__ID__' + fileInfo.id] ||
+        processedMap['__SOURCE_ID__' + fileInfo.id] ||
+        processedMap['__URL__' + normalizeDriveUrlForKey_(sourceUrl)] ||
+        processedMap['__URL_ALT__' + sourceUrl.replace(/^https?:\/\//, '').replace(/\?.*$/, '')]
+      ) {
+        Logger.log('Tracker append skipped duplicate: ' + fileName);
+        return false;
+      }
+    }
+
+    const tracker = ss.getSheetByName(CONFIG.trackerSheetName);
+    if (!tracker) return false;
+    tracker.appendRow([new Date(), fileInfo.name, fileInfo.year, result.rowsAdded, result.status, sourceUrl]);
+    return true;
+  } catch (e) {
+    Logger.log('appendTrackerRowIfNotDuplicate_ error: ' + (e && e.message));
+    return false;
+  }
+}
+
+// Performance logging helpers
+function ensurePerfSheetExists_() {
+  const ss = getSpreadsheet_();
+  if (!ss) return null;
+  const name = 'GR Automation Perf';
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.appendRow(['Timestamp', 'File Name', 'Year', 'ConvertMs', 'OpenMs', 'ParseMs', 'AppendMs', 'TotalMs', 'RowsAdded', 'Status']);
+  }
+  return sh;
+}
+
+function logPerfEntry_(fileInfo, timings) {
+  try {
+    const sh = ensurePerfSheetExists_();
+    if (!sh) return;
+    sh.appendRow([
+      new Date(),
+      fileInfo.name,
+      fileInfo.year,
+      timings.convertMs || 0,
+      timings.openMs || 0,
+      timings.parseMs || 0,
+      timings.appendMs || 0,
+      timings.totalMs || 0,
+      timings.rowsAdded || 0,
+      timings.status || '',
+    ]);
+  } catch (e) {
+    Logger.log('logPerfEntry_ error: ' + (e && e.message));
+  }
+}
+
 
 function normalizeTrackerFileLinkColumnNow() {
   const ss = getSpreadsheet_();
@@ -1949,14 +2340,14 @@ function normalizeTrackerFileLinkColumnNow() {
 
   notify_(
     "Tracker File Link normalization complete.\n" +
-      "Rows scanned: " +
-      rowCount +
-      "\n" +
-      "Rows updated: " +
-      changed +
-      "\n" +
-      "Recovered by file name match: " +
-      recoveredByName,
+    "Rows scanned: " +
+    rowCount +
+    "\n" +
+    "Rows updated: " +
+    changed +
+    "\n" +
+    "Recovered by file name match: " +
+    recoveredByName,
   );
 }
 
@@ -1976,6 +2367,178 @@ function buildFileUrlMapByName_(folder) {
   }
 
   return map;
+}
+
+// Backfill helper: fill missing "Source File" links by matching tokens
+function backfillMissingSourceLinks_(dryRun) {
+  const ss = getSpreadsheet_();
+  if (!ss) return 'Bound spreadsheet not found.';
+
+  const sourceFolder = findFolder_(CONFIG.sourceFolderName);
+  if (!sourceFolder) return 'Source folder not found: ' + CONFIG.sourceFolderName;
+
+  // Build file index from source folder
+  const filesArr = [];
+  const files = sourceFolder.getFiles();
+  while (files.hasNext()) {
+    const f = files.next();
+    filesArr.push({
+      name: String(f.getName() || ''),
+      nameLower: String(f.getName() || '').toLowerCase(),
+      url: f.getUrl(),
+      id: f.getId(),
+    });
+  }
+
+  const years = getConfiguredYears_();
+  let totalScanned = 0,
+    totalUpdated = 0,
+    totalAmbiguous = 0,
+    totalNoMatch = 0;
+  const notes = [];
+
+  years.forEach(function (year) {
+    const sh = findOutputSheetByYear_(ss, year);
+    if (!sh) {
+      notes.push(year + ': sheet not found');
+      return;
+    }
+
+    const lastRow = sh.getLastRow();
+    if (lastRow < 2) {
+      notes.push(year + ': no data rows');
+      return;
+    }
+
+    const sourceCol = getColumnIndexByHeader_(sh, CONFIG.sourceHeaderName);
+    if (sourceCol < 1) {
+      notes.push(year + ': Source File column not found');
+      return;
+    }
+
+    const poCol = getColumnIndexByHeader_(sh, 'PO No.');
+    const grCol = getColumnIndexByHeader_(sh, 'GR Mat. Doc.');
+    const wbsCol = getColumnIndexByHeader_(sh, 'WBS Element');
+    const poPlaCol = getColumnIndexByHeader_(sh, 'PO PLA ID');
+    const instPlaCol = getColumnIndexByHeader_(sh, 'Installed PLA ID');
+
+    const rowCount = lastRow - 1;
+    const maxCol = Math.max(sh.getLastColumn(), sourceCol);
+    const data = sh.getRange(2, 1, rowCount, maxCol).getDisplayValues();
+
+    const outSources = [];
+    let scanned = 0,
+      updated = 0,
+      ambiguous = 0,
+      nomatch = 0;
+
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i];
+      const existing = String(row[sourceCol - 1] || '').trim();
+      scanned++;
+      if (existing) {
+        outSources.push([existing]);
+        continue;
+      }
+
+      // Collect possible search tokens from the row
+      const tokens = [];
+      if (poCol > 0) tokens.push(String(row[poCol - 1] || '').trim());
+      if (grCol > 0) tokens.push(String(row[grCol - 1] || '').trim());
+      if (wbsCol > 0) tokens.push(String(row[wbsCol - 1] || '').trim());
+      if (poPlaCol > 0) tokens.push(String(row[poPlaCol - 1] || '').trim());
+      if (instPlaCol > 0) tokens.push(String(row[instPlaCol - 1] || '').trim());
+
+      const tokensClean = tokens
+        .filter(function (t) {
+          return t && String(t).trim() !== '';
+        })
+        .map(function (t) {
+          return String(t).toLowerCase();
+        });
+
+      if (tokensClean.length === 0) {
+        outSources.push(['']);
+        nomatch++;
+        continue;
+      }
+
+      // Find candidate files that match any token; track match counts
+      const candidates = [];
+      for (let fI = 0; fI < filesArr.length; fI++) {
+        const fn = filesArr[fI].nameLower;
+        let matchCount = 0;
+        for (let ti = 0; ti < tokensClean.length; ti++) {
+          if (tokensClean[ti] && fn.indexOf(tokensClean[ti]) !== -1) matchCount++;
+        }
+        if (matchCount > 0) candidates.push({ file: filesArr[fI], matchCount: matchCount });
+      }
+
+      if (candidates.length === 1) {
+        const f = candidates[0].file;
+        const formula =
+          '=HYPERLINK("' + f.url.replace(/"/g, '""') + '","' + f.name.replace(/"/g, '""') + '")';
+        outSources.push([formula]);
+        updated++;
+      } else if (candidates.length > 1) {
+        // sort by matchCount descending; if top is unique, choose it
+        candidates.sort(function (a, b) {
+          return b.matchCount - a.matchCount;
+        });
+        if (candidates[0].matchCount > (candidates[1] ? candidates[1].matchCount : 0)) {
+          const f = candidates[0].file;
+          const formula =
+            '=HYPERLINK("' + f.url.replace(/"/g, '""') + '","' + f.name.replace(/"/g, '""') + '")';
+          outSources.push([formula]);
+          updated++;
+        } else {
+          outSources.push(['']);
+          ambiguous++;
+        }
+      } else {
+        outSources.push(['']);
+        nomatch++;
+      }
+    }
+
+    // Write back unless dryRun
+    if (!dryRun) {
+      try {
+        sh.getRange(2, sourceCol, outSources.length, 1).setValues(outSources);
+      } catch (e) {
+        notes.push(year + ': error writing Source File column (' + e.message + ')');
+      }
+    }
+
+    totalScanned += scanned;
+    totalUpdated += updated;
+    totalAmbiguous += ambiguous;
+    totalNoMatch += nomatch;
+    notes.push(year + ': scanned=' + scanned + ', updated=' + updated + ', ambiguous=' + ambiguous + ', no match=' + nomatch + (dryRun ? ' (dry run)' : ''));
+  });
+
+  const msg =
+    'Backfill complete. Scanned: ' +
+    totalScanned +
+    ', updated: ' +
+    totalUpdated +
+    ', ambiguous: ' +
+    totalAmbiguous +
+    ', no match: ' +
+    totalNoMatch +
+    '\n\n' +
+    notes.join('\n');
+
+  if (!dryRun) notify_(msg);
+  return msg;
+}
+
+function backfillMissingSourceLinksPreview() {
+  return backfillMissingSourceLinks_(true);
+}
+
+function backfillMissingSourceLinksNow() {
+  return backfillMissingSourceLinks_(false);
 }
 
 function requeueNoDataFiles() {
@@ -2026,7 +2589,7 @@ function cleanupTempFiles() {
   if (ss) ss.toast("Cleaned " + count + " temp file(s).", "GR Automation", 8);
 }
 
-// Notification helper
+// NOTIFICATION
 function notify_(message) {
   try {
     SpreadsheetApp.getUi().alert(message);
@@ -2035,7 +2598,7 @@ function notify_(message) {
   }
 }
 
-// Debug tools
+// DEBUG TOOLS
 function debugTestSingleFile() {
   const sourceFolder = findFolder_(CONFIG.sourceFolderName);
   if (!sourceFolder) {
@@ -2046,11 +2609,15 @@ function debugTestSingleFile() {
   const files = sourceFolder.getFiles();
   let testFile = null;
 
+  const years = getConfiguredYears_();
   while (files.hasNext()) {
     const f = files.next();
     const n = f.getName().toLowerCase();
+    const hasYear = years.some(function (y) {
+      return n.indexOf(y) !== -1;
+    });
     if (
-      (n.indexOf("2025") !== -1 || n.indexOf("2026") !== -1) &&
+      hasYear &&
       (n.indexOf(".xlsx") !== -1 || n.indexOf(".xls") !== -1)
     ) {
       testFile = f;
@@ -2059,7 +2626,9 @@ function debugTestSingleFile() {
   }
 
   if (!testFile) {
-    SpreadsheetApp.getUi().alert("No 2025/2026 Excel file found.");
+    SpreadsheetApp.getUi().alert(
+      "No Excel file found for configured years: " + getConfiguredYears_().join(", "),
+    );
     return;
   }
 
@@ -2080,10 +2649,10 @@ function debugTestSingleFile() {
     SpreadsheetApp.getUi().alert(
       "Debug Result",
       "File: " +
-        testFile.getName() +
-        "\nRows extracted: " +
-        rows.length +
-        "\nCheck View > Logs for per-tab details.",
+      testFile.getName() +
+      "\nRows extracted: " +
+      rows.length +
+      "\nCheck View > Logs for per-tab details.",
       SpreadsheetApp.getUi().ButtonSet.OK,
     );
   } catch (e) {
@@ -2092,12 +2661,12 @@ function debugTestSingleFile() {
     if (tempFileId) {
       try {
         DriveApp.getFileById(tempFileId).setTrashed(true);
-      } catch (e2) {}
+      } catch (e2) { }
     }
   }
 }
 
-// Diagnostic checking
+// DIAGNOSTIC CHECKING
 function debugMainSiteSetup() {
   const ss = getSpreadsheet_();
   if (!ss) {
@@ -2108,50 +2677,116 @@ function debugMainSiteSetup() {
   const allNames = ss.getSheets().map(function (s) {
     return s.getName();
   });
-  const sh2025 = findOutputSheetByYear_(ss, "2025");
-  const sh2026 = findOutputSheetByYear_(ss, "2026");
-
   let msg = [];
   msg.push("All sheets: " + allNames.join(" | "));
-  msg.push("Detected 2025 sheet: " + (sh2025 ? sh2025.getName() : "NOT FOUND"));
-  msg.push("Detected 2026 sheet: " + (sh2026 ? sh2026.getName() : "NOT FOUND"));
-
-  if (sh2025) {
-    msg.push(
-      "2025 Installed PLA ID col: " +
-        getColumnIndexByHeader_(sh2025, "Installed PLA ID"),
-    );
-    msg.push(
-      "2025 Regional Area col: " +
-        getColumnIndexByHeader_(sh2025, "Regional Area"),
-    );
-    msg.push(
-      "2025 Cleaned Site Name col: " +
-        getColumnIndexByHeader_(sh2025, "Cleaned Site Name"),
-    );
-    msg.push(
-      "2025 Territory col: " + getColumnIndexByHeader_(sh2025, "Territory"),
-    );
-  }
-  if (sh2026) {
-    msg.push(
-      "2026 Installed PLA ID col: " +
-        getColumnIndexByHeader_(sh2026, "Installed PLA ID"),
-    );
-    msg.push(
-      "2026 Regional Area col: " +
-        getColumnIndexByHeader_(sh2026, "Regional Area"),
-    );
-    msg.push(
-      "2026 Cleaned Site Name col: " +
-        getColumnIndexByHeader_(sh2026, "Cleaned Site Name"),
-    );
-    msg.push(
-      "2026 Territory col: " + getColumnIndexByHeader_(sh2026, "Territory"),
-    );
-  }
+  const years = getConfiguredYears_();
+  years.forEach(function (y) {
+    const sh = findOutputSheetByYear_(ss, y);
+    msg.push("Detected " + y + " sheet: " + (sh ? sh.getName() : "NOT FOUND"));
+    if (sh) {
+      msg.push(y + " Installed PLA ID col: " + getColumnIndexByHeader_(sh, "Installed PLA ID"));
+      msg.push(y + " Regional Area col: " + getColumnIndexByHeader_(sh, "Regional Area"));
+      msg.push(y + " Cleaned Site Name col: " + getColumnIndexByHeader_(sh, "Cleaned Site Name"));
+      msg.push(y + " Territory col: " + getColumnIndexByHeader_(sh, "Territory"));
+    }
+  });
 
   notify_(msg.join("\n"));
+}
+
+// UI: show modal picker to process a specific year
+function showYearPicker() {
+  const html = HtmlService.createHtmlOutput(
+    '<div style="font-family: Arial, sans-serif; padding:12px;">' +
+    '<label for="yearSelect">Select existing year to process:</label><br/>' +
+    '<select id="yearSelect" style="width:100%; margin-top:8px; margin-bottom:8px;"></select>' +
+    '<div style="margin-top:6px; margin-bottom:6px;">OR enter a new year to add and process:</div>' +
+    '<input id="newYear" placeholder="e.g. 2027" style="width:48%; margin-right:4%;">' +
+    '<input id="newSheet" placeholder="Sheet name (optional)" style="width:48%;"><br/>' +
+    '<label style="font-size:90%;"><input type="checkbox" id="createSheet" checked> Create sheet in this spreadsheet if missing</label>' +
+    '<div style="text-align:right; margin-top:10px;"><button id="startBtn" onclick="startProcess()">Start</button> <button onclick="google.script.host.close()">Cancel</button></div>' +
+    '<script>' +
+    'function populate(years){ var sel = document.getElementById("yearSelect"); sel.innerHTML = ""; years.forEach(function(y){ var o = document.createElement("option"); o.value = y; o.text = y; sel.appendChild(o); }); }' +
+    'function startProcess(){ var newY = document.getElementById("newYear").value.trim(); var sheetName = document.getElementById("newSheet").value.trim(); var create = document.getElementById("createSheet").checked; var sel = document.getElementById("yearSelect"); var y = sel.value; document.getElementById("startBtn").disabled = true; if(newY){ if(!/^[0-9]{4}$/.test(newY)){ alert("Enter a valid 4-digit year."); document.getElementById("startBtn").disabled = false; return; } google.script.run.withSuccessHandler(function(msg){ alert(msg); google.script.run.withSuccessHandler(function(msg2){ alert(msg2); google.script.host.close(); }).runConsolidateForYear(newY); }).addConfiguredYear(newY, sheetName, "", create); } else { if(!y){ alert("Please select a year or enter a new one."); document.getElementById("startBtn").disabled = false; return; } google.script.run.withSuccessHandler(function(msg){ alert(msg); google.script.host.close(); }).runConsolidateForYear(y); } }' +
+    'google.script.run.withSuccessHandler(populate).getConfiguredYearsForUi();' +
+    '</script>' +
+    '</div>',
+  ).setWidth(520).setHeight(220);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Process Year');
+}
+
+function getConfiguredYearsForUi() {
+  return getConfiguredYears_();
+}
+
+function runConsolidateForYear(year) {
+  const startTime = Date.now();
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) return 'Another run is already in progress. Try again later.';
+  try {
+    const ss = getSpreadsheet_();
+    if (!ss) return 'Target spreadsheet not found. Run setup first.';
+    ensureSheets_(ss);
+
+    const sourceFolder = findFolder_(CONFIG.sourceFolderName);
+    if (!sourceFolder) return 'Source folder not found: ' + CONFIG.sourceFolderName;
+
+    const processedMap = loadProcessedMap_(ss);
+    const failedAttemptsMap = loadFailedAttemptsMap_(ss);
+    const candidates = listCandidateFilesByYear_(sourceFolder, processedMap, failedAttemptsMap);
+
+    if (!candidates || !candidates[year] || candidates[year].length === 0) {
+      return 'No candidate files found for ' + year;
+    }
+
+    const toProcess = candidates[year].slice(0, CONFIG.maxFilesPerRunPerYear);
+    const tempFolder = getOrCreateTempFolder_();
+
+    let processedCount = 0;
+    let totalRowsAdded = 0;
+
+    for (let i = 0; i < toProcess.length; i++) {
+      if (Date.now() - startTime > CONFIG.maxRuntimeMs) {
+        break;
+      }
+
+      const fileInfo = toProcess[i];
+      if (
+        processedMap[fileInfo.name] ||
+        processedMap[normalizeFileKey_(fileInfo.name)] ||
+        processedMap['__ID__' + fileInfo.id] ||
+        processedMap['__SOURCE_ID__' + fileInfo.id] ||
+        processedMap['__URL__' + normalizeDriveUrlForKey_(fileInfo.url)] ||
+        processedMap['__URL_ALT__' + String(fileInfo.url || '').replace(/^https?:\/\//, '').replace(/\?.*$/, '')]
+      ) {
+        Logger.log('Skipping already processed file: ' + fileInfo.name);
+        continue;
+      }
+
+      const result = processSingleFile_(ss, fileInfo, tempFolder);
+      appendTrackerRowIfNotDuplicate_(ss, fileInfo, result, processedMap);
+
+      if (String(result.status || '').toLowerCase() === 'done') {
+        processedMap[fileInfo.name] = true;
+        processedMap[normalizeFileKey_(fileInfo.name)] = true;
+        processedMap['__ID__' + fileInfo.id] = true;
+        processedMap['__SOURCE_ID__' + fileInfo.id] = true;
+        const sourceUrl = String(fileInfo.url || '').trim();
+        processedMap['__URL__' + normalizeDriveUrlForKey_(sourceUrl)] = true;
+        processedMap['__URL_ALT__' + sourceUrl.replace(/^https?:\/\//, '').replace(/\?.*$/, '')] = true;
+      }
+
+      processedCount++;
+      totalRowsAdded += result.rowsAdded;
+    }
+
+    return 'Done: files=' + processedCount + ', rows=' + totalRowsAdded;
+  } catch (e) {
+    Logger.log('runConsolidateForYear error: ' + (e && e.message));
+    return 'Error: ' + (e && e.message ? e.message : String(e));
+  } finally {
+    try { lock.releaseLock(); } catch (er) { }
+  }
 }
 
 function debugAutoProcessingStatus() {
@@ -2190,8 +2825,10 @@ function debugAutoProcessingStatus() {
 
       totalExcel++;
 
-      const hasYear =
-        name.indexOf("2025") !== -1 || name.indexOf("2026") !== -1;
+      const years = getConfiguredYears_();
+      const hasYear = years.some(function (y) {
+        return name.indexOf(y) !== -1;
+      });
       if (!hasYear) {
         noYear++;
         if (sampleNoYear.length < 5) sampleNoYear.push(name);
@@ -2218,22 +2855,17 @@ function debugAutoProcessingStatus() {
     "Auto Processing Status",
     "",
     "Trigger active count: " + triggers.length,
-    "Last run started: " +
-      (scriptProps.getProperty("LAST_RUN_STARTED_AT") || "N/A"),
-    "Last run finished: " +
-      (scriptProps.getProperty("LAST_RUN_FINISHED_AT") || "N/A"),
+    "Last run started: " + (scriptProps.getProperty("LAST_RUN_STARTED_AT") || "N/A"),
+    "Last run finished: " + (scriptProps.getProperty("LAST_RUN_FINISHED_AT") || "N/A"),
     "Last run status: " + (scriptProps.getProperty("LAST_RUN_STATUS") || "N/A"),
-    "Last active file: " +
-      (scriptProps.getProperty("LAST_RUN_ACTIVE_FILE") || "N/A"),
-    "Last active year: " +
-      (scriptProps.getProperty("LAST_RUN_ACTIVE_YEAR") || "N/A"),
+    "Last active file: " + (scriptProps.getProperty("LAST_RUN_ACTIVE_FILE") || "N/A"),
+    "Last active year: " + (scriptProps.getProperty("LAST_RUN_ACTIVE_YEAR") || "N/A"),
     "Last stage: " + (scriptProps.getProperty("LAST_RUN_STAGE") || "N/A"),
-    "Last candidate counts: " +
-      (scriptProps.getProperty("LAST_RUN_CANDIDATES") || "N/A"),
+    "Last candidate counts: " + (scriptProps.getProperty("LAST_RUN_CANDIDATES") || "N/A"),
     "",
     "Source folder stats",
     "Excel files total: " + totalExcel,
-    "Excel files with 2025/2026 in name: " + withYear,
+    "Excel files with " + getConfiguredYears_().join("/") + " in name: " + withYear,
     "Excel files skipped (missing year in file name): " + noYear,
     "Already done: " + alreadyDone,
     "Blocked by failed-attempt limit: " + blockedByFailedAttempts,
@@ -2242,7 +2874,7 @@ function debugAutoProcessingStatus() {
 
   if (sampleNoYear.length) {
     msg.push("");
-    msg.push("Sample skipped files (missing 2025/2026 in filename):");
+    msg.push("Sample skipped files (missing " + getConfiguredYears_().join("/") + " in filename):");
     sampleNoYear.forEach(function (n) {
       msg.push("- " + n);
     });
@@ -2252,9 +2884,11 @@ function debugAutoProcessingStatus() {
 }
 
 function findOutputSheetByYear_(ss, year) {
-  const exact = ss.getSheetByName(CONFIG.outputSheets[year]);
+  const name = getOutputSheetNameForYear(year);
+  const exact = ss.getSheetByName(name);
   if (exact) return exact;
 
+  // fallback: fuzzy match like before
   const target = ("gr posted " + year).toLowerCase();
   const sheets = ss.getSheets();
   for (var i = 0; i < sheets.length; i++) {
