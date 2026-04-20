@@ -142,7 +142,13 @@ const CONFIG = {
   headerScanMaxRows: 80,       // Scan this many rows to find header
   minHeaderMatches: 3,         // Require at least 3 column matches
   
-  // Safety checks
+  // Performance tuning (v10+)
+  maxRowsPerSheetScan: 2500,   // Max rows to scan per sheet (memory/time guard)
+  maxColsPerSheetScan: 45,     // Max column range to scan
+  preferDirectTemplateTabFastPath: true,  // Fast-path: use "GR TEMPLATE" tab immediately
+  useNumberFormatCurrencyHints: false,    // Infer currency from number format hints
+  
+  // Safety & filtering
   maxFailedAttemptsPerFile: 5, // Skip files after 5 failed attempts
   onlyIncludeVisibleRows: true, // Ignore hidden/filtered rows
 };
@@ -815,6 +821,206 @@ If auto-trigger enabled:
   ├─ Skips "GR_REQUEST_2025_April.xlsx" (already in processedMap)
   └─ Processes next batch (max 6 files, respecting limits)
 ```
+
+---
+
+## Major Code Sections (continued)
+
+### Section 7: Duplicate Cleanup & Maintenance
+
+**Location:** Lines 3206–3354, 3357–3438, 3441–3523  
+**Invoked by:** Manual menu clicks: "Admin" → "Cleanup Duplicates (Preview)" or "Cleanup Duplicates (Now)"
+
+**Pseudocode:**
+```javascript
+function cleanupDuplicates_(dryRun) {
+  // dryRun = true  → preview mode (no changes)
+  // dryRun = false → apply mode (permanent deletion)
+  
+  var summary = {
+    trackerRemoved: 0,
+    outputRemoved: 0,
+    previewExamples: [],
+  };
+  
+  // Phase 1: Build cleanup plan for Processed Files Log (tracker)
+  var trackerPlan = buildTrackerDuplicateCleanupPlan_(tracker);
+  // Result: {groupsCount, rowsToDelete: [[rowNum, reason], ...]}
+  
+  // Phase 2: Build cleanup plans for each output sheet
+  var outputPlans = {};
+  for (var year in outputSheets) {
+    outputPlans[year] = buildOutputDuplicateCleanupPlan_(
+      ss, outputSheets[year], year, doneTrackerKeyMap
+    );
+  }
+  
+  // Phase 3: Preview phase
+  if (dryRun) {
+    // Show examples of what would be deleted
+    var examples = buildDuplicatePreviewExamples_(
+      [trackerPlan, ...outputPlans], 
+      groupLimit=5, 
+      rowLimit=2
+    );
+    
+    // Display in UI or log
+    notify_("Preview: " + trackerPlan.groupsCount + " tracker groups; " +
+            "Output groups: " + Object.keys(outputPlans).length);
+    return {preview: true, examples: examples};
+  }
+  
+  // Phase 4: Apply phase (only if not dryRun)
+  // Ask user confirmation (modal dialog)
+  var confirmed = confirm_(
+    "Delete " + trackerPlan.rowsToDelete.length + " tracker rows + " + 
+    "output duplicates? BACKUP RECOMMENDED. Continue?"
+  );
+  
+  if (!confirmed) {
+    return {applied: false, cancelled: true};
+  }
+  
+  // Delete tracker rows (in reverse order to preserve row numbers)
+  deleteRowsInReverse_(tracker, trackerPlan.rowsToDelete);
+  summary.trackerRemoved = trackerPlan.rowsToDelete.length;
+  
+  // Delete output sheet rows (in reverse order per sheet)
+  for (var year in outputPlans) {
+    var plan = outputPlans[year];
+    var sheet = ss.getSheetByName(getOutputSheetNameForYear(year));
+    if (sheet) {
+      deleteRowsInReverse_(sheet, plan.rowsToDelete);
+      summary.outputRemoved += plan.rowsToDelete.length;
+    }
+  }
+  
+  return {applied: true, summary: summary};
+}
+
+function buildTrackerDuplicateCleanupPlan_(trackerSheet) {
+  // Scan Processed Files Log for duplicate file entries
+  // A duplicate = same source file processed multiple times with "Done" status
+  
+  var keyMap = {};  // Maps file key → array of row objects
+  var rowCount = trackerSheet.getLastRow() - 1;  // Exclude header
+  
+  // Read all rows, group by file identity
+  for (var i = 2; i <= rowCount + 1; i++) {
+    var row = trackerSheet.getRange(i, 1, 1, 7).getValues()[0];
+    var fileName = row[1];  // Column B
+    var status = row[5];    // Column F
+    var fileUrl = row[6];   // Column G
+    
+    // Build a composite key from filename and URL
+    var key = normalizeFileKey_(fileName) + "||" + normalizeDriveUrlForKey_(fileUrl);
+    
+    if (!keyMap[key]) {
+      keyMap[key] = [];
+    }
+    
+    keyMap[key].push({rowNum: i, status: status, fileName: fileName, timestamp: row[0]});
+  }
+  
+  // Identify duplicates: groups with > 1 row
+  var rowsToDelete = [];
+  for (var key in keyMap) {
+    var rows = keyMap[key];
+    
+    if (rows.length > 1) {
+      // Multiple entries for same file
+      // Keep: most recent "Done" entry
+      // Delete: all others
+      
+      var doneRows = rows.filter(function(r) { return normalizeStatus_(r.status) === "done"; });
+      
+      if (doneRows.length > 1) {
+        // Multiple "Done" entries: keep newest, delete rest
+        doneRows.sort(function(a, b) { return b.timestamp - a.timestamp; });
+        var keepRowNum = doneRows[0].rowNum;
+        
+        for (var i = 1; i < doneRows.length; i++) {
+          rowsToDelete.push([doneRows[i].rowNum, "duplicate of row " + keepRowNum]);
+        }
+      }
+      
+      // Non-"Done" entries with "Done" alternative: delete the non-Done ones
+      var nonDoneRows = rows.filter(function(r) { return normalizeStatus_(r.status) !== "done"; });
+      if (doneRows.length > 0 && nonDoneRows.length > 0) {
+        for (var i = 0; i < nonDoneRows.length; i++) {
+          rowsToDelete.push([nonDoneRows[i].rowNum, "duplicate (non-done) of row " + doneRows[0].rowNum]);
+        }
+      }
+    }
+  }
+  
+  return {
+    groupsCount: Object.keys(keyMap).length,
+    rowsToDelete: rowsToDelete,
+  };
+}
+
+function buildOutputDuplicateCleanupPlan_(ss, sheet, year, doneTrackerKeyMap) {
+  // Similar logic for output sheet: find duplicate rows that link to same source file
+  // Keyed by: Source File column value + PO number
+  
+  var keyMap = {};
+  var rowCount = sheet.getLastRow() - 1;
+  var sourceFileCol = getColumnIndexByHeader_(sheet, "Source File");
+  var poCol = getColumnIndexByHeader_(sheet, "PO No.");
+  
+  // Read all rows
+  for (var i = 2; i <= rowCount + 1; i++) {
+    var sourceFile = sheet.getRange(i, sourceFileCol, 1, 1).getValue();
+    var poNo = sheet.getRange(i, poCol, 1, 1).getValue();
+    
+    // Build composite key
+    var key = normalizeFileKey_(String(sourceFile || "")) + "||" + String(poNo || "");
+    
+    if (!keyMap[key]) {
+      keyMap[key] = [];
+    }
+    
+    keyMap[key].push({rowNum: i, sourceFile: sourceFile});
+  }
+  
+  // Identify duplicates
+  var rowsToDelete = [];
+  for (var key in keyMap) {
+    var rows = keyMap[key];
+    if (rows.length > 1) {
+      // Keep first, delete rest
+      for (var i = 1; i < rows.length; i++) {
+        rowsToDelete.push([rows[i].rowNum, "duplicate of row " + rows[0].rowNum]);
+      }
+    }
+  }
+  
+  return {
+    groupsCount: Object.keys(keyMap).length,
+    rowsToDelete: rowsToDelete,
+  };
+}
+
+function deleteRowsInReverse_(sheet, rowsToDelete) {
+  // Sort rows in descending order (to preserve row numbers during deletion)
+  rowsToDelete.sort(function(a, b) { return b[0] - a[0]; });
+  
+  // Delete from bottom to top
+  for (var i = 0; i < rowsToDelete.length; i++) {
+    var rowNum = rowsToDelete[i][0];
+    sheet.deleteRow(rowNum);
+  }
+}
+```
+
+**Design rationale:**
+- **Two-phase approach:** Preview mode lets users verify logic before deletion
+- **Reverse-order deletion:** Deleting bottom-up preserves row numbers
+- **Composite keys:** Matches rows by file + PO, reducing false positives
+- **Status checking:** Prefers keeping "Done" entries (most complete)
+- **Confirmation dialog:** Protects against accidental mass deletion
+- **Backup recommendation:** Users encouraged to export/backup first
 
 ---
 

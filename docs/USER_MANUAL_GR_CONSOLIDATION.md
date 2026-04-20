@@ -270,6 +270,59 @@ maxFailedAttemptsPerFile: 5
 
 **Safe to leave as-is:** Yes. You can manually requeue files using "Processing" → "Retry Failed Files".
 
+#### New Performance & Parsing Settings
+
+##### Max Rows Per Sheet Scan
+```
+maxRowsPerSheetScan: 2500
+```
+**What it does:** Limits how many rows are scanned during extraction (prevents slowdowns on very large sheets).
+
+**Safe to leave as-is:** Yes. Increase if your sheets have > 2500 data rows; decrease if you experience timeouts.
+
+##### Max Columns Per Sheet Scan
+```
+maxColsPerSheetScan: 45
+```
+**What it does:** Limits the column scan range (memory and time guard for very wide sheets).
+
+**Safe to leave as-is:** Yes. Standard for most GR templates.
+
+##### Prefer Direct Template Tab (Fast Path)
+```
+preferDirectTemplateTabFastPath: true
+```
+**What it does:** If a sheet tab is named something like "GR TEMPLATE", the script uses it immediately (skips scoring other tabs).
+
+**Why it helps:** Dramatically speeds up parsing when you have a consistently named data tab.
+
+**Safe to leave as-is:** Yes. Set to `false` if you have unusual sheet naming and the auto-detection is picking the wrong tab.
+
+##### Only Include Visible Rows
+```
+onlyIncludeVisibleRows: true
+```
+**What it does:** By default, the script skips hidden/filtered rows (respects your visible/hidden state in the Excel file).
+
+**If you need hidden rows:** Set to `false` to process all rows regardless of visibility.
+
+**Safe to leave as-is:** Yes. Most use cases want only visible rows.
+
+#### Changed Defaults (v10 Performance Update)
+
+The following settings have been adjusted in v10 for better performance and reliability:
+
+- **`maxFilesPerRunTotal`**: Changed from 16 to **6** (fewer files per run = more stable)
+- **`maxFilesPerRunPerYear`**: Changed from 8 to **3** (balanced processing across years)
+- **`maxRuntimeMs`**: Changed from 260000 to **120000** (2 minutes; better for automatic 1-minute triggers)
+- **`openRetryAttempts`**: Changed from 8 to **3** (faster failure detection)
+- **`openRetryDelayMs`**: Changed from 1500 to **500** (quicker retries)
+
+**Should you change these?** Usually no. These defaults are tuned for reliability. Only adjust if:
+- You have very few files → increase `maxFilesPerRunTotal` to 10–15
+- You have timeouts → decrease the numbers further
+- You want slower, more frequent runs → decrease `maxFilesPerRunTotal` to 3–4
+
 ---
 
 ## Your First Run Walkthrough
@@ -572,6 +625,62 @@ This menu has advanced tools for troubleshooting and maintenance.
   2. The script moves all temp files to Drive trash
   3. A notification will say "X temp files cleaned up." (or "No temp files found.")
   4. The files are now in your Drive Trash (you can recover them for 30 days if needed)
+
+#### Cleanup Duplicates (Preview)
+- **What it does:** Scans the Processed Files Log and all output sheets for duplicate records (same source file processed multiple times) and shows a **preview** of what would be deleted WITHOUT making changes.
+- **When to use:**
+  - You suspect duplicate rows in your output sheets
+  - A file was accidentally processed twice
+  - You want to verify the duplicate-detection logic before applying deletions
+  - **Always run Preview first before running Now**
+- **How to use:**
+  1. Click **GR Automation** → **Admin** → **Cleanup Duplicates (Preview)**
+  2. A notification or modal will show:
+     - Number of duplicate groups found (e.g., "5 duplicate groups in Processed Files Log")
+     - Number of duplicate groups found in each output sheet (e.g., "3 in GR Posted 2025")
+     - Examples of which rows would be kept vs. deleted (usually keeps the most recent "Done" entry)
+  3. Review the examples to verify they're correct
+  4. If happy with the logic, proceed to "Cleanup Duplicates (Now)"
+  5. **If not happy:** Manually review and delete rows, or adjust your workflow to prevent duplicates
+
+#### Cleanup Duplicates (Now)
+- **What it does:** After you've reviewed the Preview, this tool **permanently deletes** duplicate rows from the Processed Files Log and all output sheets.
+- **⚠️ WARNING:** This makes permanent changes to your sheets. Recommended: **Always run Preview first and export/backup your sheets before proceeding**.
+- **When to use:**
+  - You ran "Cleanup Duplicates (Preview)" and approved the results
+  - You're confident duplicates exist and need removal
+  - You have a backup of your data
+- **How to use:**
+  1. (Strongly recommended) First, run "Cleanup Duplicates (Preview)" to verify logic
+  2. (Strongly recommended) Export/backup your sheets to another location or download as CSV/Excel
+  3. Click **GR Automation** → **Admin** → **Cleanup Duplicates (Now)**
+  4. A confirmation dialog will appear asking "Are you sure?" with details about what will be deleted
+  5. Click **OK** to proceed (or **Cancel** to abort)
+  6. The script scans and deletes duplicates
+  7. A notification will show results (e.g., "Deleted 5 duplicate rows from tracker; Deleted 3 from GR Posted 2025")
+  8. Review your sheets to confirm results look correct
+
+**How duplicate detection works:**
+- **Matching strategy:** Compares rows using Drive file ID, normalized filename, and URL variants
+- **What it deletes:** Only rows that are marked "Done" (successful) and match a previous "Done" entry for the same source file
+- **What it keeps:** The most recent "Done" entry for each unique source file (most authoritative)
+- **Tracker:** Duplicate rows are removed from "Processed Files Log"
+- **Output sheets:** Duplicate data rows are removed from "GR Posted 2025", "GR Posted 2026", etc.
+
+**Backup recommendation:**
+Before running Cleanup Duplicates (Now), consider:
+1. Exporting current Processed Files Log to CSV or Excel
+2. Exporting current GR Posted sheets to CSV or Excel
+3. Storing backups in a separate Drive folder or downloading locally
+4. If something goes wrong, you can copy the data back from your backup
+
+**Rollback procedure (if needed):**
+1. If you deleted rows you didn't mean to delete:
+   - Go to your Drive **Trash** folder
+   - Look for deleted rows (they may have been moved to trash)
+   - Restore them if possible
+2. Or, use your backup copy to manually restore rows
+3. Or, re-run "Process All New Files Now" to re-populate the output sheets from scratch
 
 #### Test One Source File (Debug)
 - **What it does:** Lets you pick a single Excel file and run the full processing pipeline on just that file, showing detailed debug output. Useful for troubleshooting why a particular file isn't working.
@@ -1063,6 +1172,93 @@ Remember, automatic processing is still subject to the same limits:
 - Max 2 minutes per run
 
 If you have 100 files waiting, they'll be processed over many 1-minute intervals (10–15 minutes total to clear the queue).
+
+### Understanding Script Properties & Run State
+
+When automatic processing runs, the script stores detailed information in **Script Properties** so you can monitor progress and troubleshoot:
+
+| Property Name | What It Contains | Example Value |
+|---|---|---|
+| **BOUND_SPREADSHEET_ID** | The ID of your main spreadsheet (used for multi-spreadsheet routing) | `1AbCdefGhIjKlmNoPqRsTuVwXyZ2345...` |
+| **LAST_RUN_STARTED_AT** | Timestamp of when the last processing run began | `2026-04-20 03:45:30 PM` |
+| **LAST_RUN_FINISHED_AT** | Timestamp of when the last processing run completed | `2026-04-20 03:47:15 PM` |
+| **LAST_RUN_STATUS** | Overall status of the last run | `"Completed successfully"` or `"Error: ..."` |
+| **LAST_RUN_STAGE** | What stage the script is currently in | `"Scanning files"`, `"Converting files"`, `"Appending rows"` |
+| **LAST_RUN_ACTIVE_FILE** | Name of the file currently being processed (in progress runs) | `"GR_REQUEST_2025_April.xlsx"` |
+| **LAST_RUN_ACTIVE_YEAR** | Year of the file being processed | `2025` or `2026` |
+| **LAST_RUN_CANDIDATES** | List of files waiting to be processed | `["file1.xlsx", "file2.xlsx", ...]` |
+
+**How to view these properties:**
+1. Open **Extensions** → **Apps Script**
+2. Click the **gear icon** (Project Settings)
+3. Scroll down to **Script Properties**
+4. You'll see all the properties listed above with their current values
+
+**Why they're useful:**
+- **Debugging:** If processing seems stuck, check `LAST_RUN_STATUS` and `LAST_RUN_STAGE` to see what's happening
+- **Monitoring:** Check timestamps to see when the last run completed and how long it took
+- **Status checks:** Use **GR Automation** → **Automation** → **Show Auto Processing Status** (this reads these properties and displays them in a friendly modal)
+
+### Using the GR Automation Config Sheet (Optional, for Multi-Spreadsheet Routing)
+
+By default, all output sheets (GR Posted 2025, GR Posted 2026, etc.) are created in your main spreadsheet. However, you can optionally route different years to different spreadsheets.
+
+**What is the GR Automation Config sheet?**
+- An optional sheet in your main spreadsheet that maps years to external spreadsheets
+- If it doesn't exist, the script uses the default `CONFIG.outputSheets` mappings
+- If it exists and has data, the script merges its mappings with the defaults
+
+**When would you use this?**
+- You want 2025 data in one spreadsheet and 2026 data in another spreadsheet
+- You want to split large data volumes across multiple sheets/files
+- You want to customize output sheet names per year
+
+**How to set it up:**
+
+**Step 1: Create the GR Automation Config sheet**
+1. In your main spreadsheet, right-click an existing sheet tab
+2. Click **Insert 1 sheet**
+3. Name it exactly: `GR Automation Config`
+4. Click **Create**
+
+**Step 2: Add headers**
+1. In the new sheet, add these column headers in the first row:
+   - Column A: `Year`
+   - Column B: `Sheet Name`
+   - Column C: `Spreadsheet ID`
+
+**Step 3: Add mappings**
+- Add rows with the following format:
+
+| Year | Sheet Name | Spreadsheet ID |
+|---|---|---|
+| 2025 | GR Posted 2025 | (leave blank) |
+| 2026 | GR Posted 2026 | `1XyZ9abCdefGhIjKlmNoPqRsTuVwXyZ...` |
+
+- **Year:** The year (e.g., 2025, 2026, 2027)
+- **Sheet Name:** The name of the target sheet for this year (e.g., "GR Posted 2025")
+- **Spreadsheet ID:** 
+  - Leave blank to use the same spreadsheet (your main spreadsheet)
+  - Provide a Spreadsheet ID (from the URL) to route to an external spreadsheet
+
+**Example:**
+```
+2025 | GR Posted 2025 |                    (use main spreadsheet)
+2026 | GR Posted 2026 | 1AbCdefGhIjKlm...  (use external spreadsheet for 2026)
+2027 | GR Posted 2027 |                    (use main spreadsheet)
+```
+
+**Step 4: Use "Process Files for Year..." to add new years**
+- When you click **GR Automation** → **Processing** → **Process Files for Year...**
+- The modal now includes options to add new years and map them to spreadsheets
+- If you select "Create sheet in this spreadsheet if missing", it will auto-create the sheet in your main spreadsheet
+- If you provide an external Spreadsheet ID, the script will only create the mapping (it will NOT auto-create the sheet in the external spreadsheet; you must create it manually)
+
+**Important notes:**
+- The GR Automation Config sheet is optional; if it doesn't exist, the script uses `CONFIG.outputSheets`
+- **Sheet creation:** Only happens in the *bound* (main) spreadsheet when no external Spreadsheet ID is provided
+- **External spreadsheets:** You must have Editor access to the external spreadsheet
+- **Sheet names:** Both the Config sheet mapping and the actual spreadsheet must have a sheet with the specified name
 
 ---
 

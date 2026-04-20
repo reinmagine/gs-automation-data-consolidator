@@ -47,7 +47,7 @@
 
   **Processing Section:**
   - Process All New Files Now
-  - Process Files for Year...
+  - Process Files for Year... — Modal dialog to select year and optionally add new years
   - Retry Failed Files
 
   **GR Posted Sheets Section:**
@@ -68,6 +68,8 @@
   **Admin Section:**
   - Check Lookup & Output Setup
   - Clean Temp Files
+  - Cleanup Duplicates (Preview) — Preview duplicate detection logic and examples
+  - Cleanup Duplicates (Now) — Permanently remove duplicate rows (after backup recommended)
   - Test One Source File (Debug)
 
 - **Processing Files – Step by Step** (detailed workflow)
@@ -457,7 +459,7 @@ Each function documented with:
 - **Troubleshooting Quick Reference** — Quick lookup table
 - **Recommended Reading Order** — By role (user, developer, admin)
 - **Quick Links** — Links to all documents
-- **Documentation Checklist** — All topics covered (✅ verified)
+- **Documentation Checklist** — All topics covered (verified)
 - **Learning Resources Included** — Organized by purpose
 - **Notes on Image Placeholders** — How to add screenshots
 - **Next Steps** — Deployment timeline, extension instructions

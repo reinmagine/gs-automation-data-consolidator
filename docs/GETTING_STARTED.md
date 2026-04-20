@@ -297,6 +297,32 @@ See: User Manual → "Troubleshooting Common Issues" for 20+ detailed scenarios
 
 ---
 
+## What's New in v10
+
+This version introduces several new features and performance improvements:
+
+### New Features
+
+- **Admin → Cleanup Duplicates (Preview/Now)** — Detect and remove duplicate rows across tracker and output sheets. Preview first to verify what would be deleted; then apply (with backup recommended).
+
+- **Processing → Process Files for Year...** — Modal dialog to process only files from a specific year, with option to add new years to the system configuration and create sheets in the bound spreadsheet.
+
+- **GR Automation Config Sheet** (optional) — Advanced feature for routing different years to different spreadsheets (requires manual sheet creation and configuration).
+
+- **Auto-Processing Status Monitoring** — View detailed run state: timestamps, file counts, next run ETA, and processing stage via "Automation → Show Auto Processing Status".
+
+### Performance Improvements
+
+- Reduced default processing limits (max 6 files/run, 3 per year, 120s timeout) for better reliability
+- New fast-path for sheets named "GR TEMPLATE" (skips scoring other tabs)
+- Respects hidden/filtered rows by default (configurable)
+- In-memory caching for config and PLA lookups
+- Optimized row scanning (limits: max 2,500 rows, 45 columns per sheet)
+
+See: User Manual → "Configuration Explained" for all new settings
+
+---
+
 ## Documentation Checklist
 
 - [x] Installation steps with image placeholders
