@@ -68,7 +68,7 @@ const COL = (function () {
   return m;
 })();
 
-// Cache for config and lookup data
+// Cache for config and lookups
 var _CACHE = {
   configMappings: null,
   plaLookupMapBySsId: {},
@@ -124,13 +124,13 @@ function getConfiguredYears_() {
     .sort();
 }
 
-// Compute enrichment for a row
+// Add enrichment columns (territory, USD, etc)
 function getEnrichmentForRow_(row, lookupMap) {
   var regional = "";
   var cleaned = "";
   var territory = "";
 
-  // Skip PLA lookup for OPEX
+  // Skip PLA for OPEX
   var wbsVal = row[COL["WBS Element"]];
   if (isOpexWbs_(wbsVal)) {
     territory = "OPEX";
@@ -141,7 +141,7 @@ function getEnrichmentForRow_(row, lookupMap) {
     return [regional, cleaned, territory, usdShort];
   }
 
-  // Try Installed PLA ID first, then PO PLA ID
+  // Try Installed PLA ID first
   var installedKey = normalizePlaLookupKey_(row[COL["Installed PLA ID"]]);
   var found = installedKey ? lookupMap[installedKey] : null;
   if (!found) {
@@ -338,7 +338,7 @@ function openPlaLookupSheet() {
   ss.setActiveSheet(sh);
 }
 
-// Trigger setup and control
+// Trigger setup
 function setupAutomaticEvery1Min() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) {
@@ -383,7 +383,7 @@ function stopAutomatic() {
     ss.toast("Stopped. Removed " + count + " trigger(s).", "GR Automation", 8);
 }
 
-// Main consolidation run
+// Main consolidation
 function consolidateGRTemplateData() {
   const startTime = Date.now();
   const lock = LockService.getScriptLock();
@@ -449,6 +449,7 @@ function consolidateGRTemplateData() {
     }
 
     const processedMap = loadProcessedMap_(ss);
+    const doneKeyMap = buildTrackerExactDoneKeyMap_(ss);
     const failedAttemptsMap = loadFailedAttemptsMap_(ss);
     const candidates = listCandidateFilesByYear_(
       sourceFolder,
@@ -504,7 +505,7 @@ function consolidateGRTemplateData() {
         continue;
       }
 
-      if (trackerHasProcessedEntry_(ss, fileInfo)) {
+      if (hasAnyProcessingKeyMatch_(doneKeyMap, fileInfo)) {
         markProcessedInMap_(processedMap, fileInfo);
         Logger.log(
           "Skipping file already present in tracker log: " + fileInfo.name,
@@ -516,7 +517,7 @@ function consolidateGRTemplateData() {
       scriptProps.setProperty("LAST_RUN_ACTIVE_YEAR", fileInfo.year);
       scriptProps.setProperty("LAST_RUN_STAGE", "Processing " + fileInfo.name);
 
-      // Skip large files (>10 MB)
+      // Skip files over 10 MB
       try {
         const file = DriveApp.getFileById(fileInfo.id);
         if (shouldSkipFileForPerformance_(file)) {
@@ -771,7 +772,7 @@ function ensureSheets_(ss) {
           ),
         );
       } else {
-        // Check if Source File header exists
+        // Check for Source File header
         const sourceCol = getColumnIndexByHeader_(sh, CONFIG.sourceHeaderName);
         if (sourceCol < 1) {
           const lastCol = sh.getLastColumn();
@@ -989,7 +990,7 @@ function fillCurrencyFromHints_(outRow, rowFormats, columnMap) {
   }
 }
 
-// Folder and file discovery
+// Find and list files
 function findFolder_(name) {
   const iter = DriveApp.getFoldersByName(name);
   if (iter.hasNext()) return iter.next();
@@ -1055,7 +1056,7 @@ function listCandidateFilesByYear_(
   const maxTotal = CONFIG.maxFilesPerRunTotal;
 
   while (files.hasNext()) {
-    // Count files added so far
+    // Check files per year limit
     var totalNow = 0;
     for (var k in candidates) totalNow += candidates[k].length;
     if (totalNow >= maxTotal) break;
@@ -1113,7 +1114,7 @@ function buildProcessList_(candidates) {
   return out;
 }
 
-// Tracker state maps
+// Load tracker state
 function loadProcessedMap_(ss) {
   const tracker = ss.getSheetByName(CONFIG.trackerSheetName);
   if (!tracker || tracker.getLastRow() <= 1) return {};
@@ -1190,7 +1191,7 @@ function loadFailedAttemptsMap_(ss) {
   return map;
 }
 
-// File conversion and processing
+// Convert and process files
 function processSingleFile_(ss, fileInfo, tempFolder) {
   let tempFileId = null;
   const t0 = Date.now();
@@ -1389,7 +1390,7 @@ function openSpreadsheetWithRetry_(fileId, attempts, delayMs) {
   );
 }
 
-// Sheet parsing and header mapping
+// Parse sheet and map headers
 function parseConvertedSheet_(tempSS, fileName) {
   const preferredCandidates = [];
   const fallbackCandidates = [];
@@ -2065,7 +2066,7 @@ function createColumnMapping_(headerRow) {
   return { count: count, map: map };
 }
 
-// Row validation and extraction
+// Row validation
 function isCellPresent_(rawValue, displayValue) {
   if (
     String(displayValue || "")
@@ -2268,7 +2269,7 @@ function isNonTrivialRow_(rawRow, dispRow) {
   return count >= 2;
 }
 
-// Cell formatting and sheet write
+// Format cells
 function formatCellByHeader_(header, rawValue, displayValue) {
   if (header === "Payment Milestone") {
     if (typeof rawValue === "number" && rawValue > 0 && rawValue <= 1) {
@@ -2385,7 +2386,7 @@ function appendRowsWithSourceLink_(sheet, rows, fileInfo, controllerSs) {
   if (rows.length === 0) return;
   controllerSs = controllerSs || getSpreadsheet_();
 
-  // Ensure header exists if sheet is new
+  // Add header row if sheet is new
   if (sheet.getLastRow() === 0) {
     sheet.appendRow(
       COLUMN_MAPPING.concat([CONFIG.sourceHeaderName]).concat(
@@ -2506,7 +2507,7 @@ function convertAmountToUsdForAllData() {
   );
 }
 
-// Convert text to hyperlink formulas
+// Hyperlink formulas
 function fixSourceFileHyperlinksNow() {
   const ss = getSpreadsheet_();
   if (!ss) {
@@ -2541,7 +2542,7 @@ function fixSourceFileHyperlinksNow() {
     const values = range.getDisplayValues();
     const formulas = range.getFormulas();
 
-    // Map files by name
+    // Build file name map
     const sourceFolder = findFolder_(CONFIG.sourceFolderName);
     const fileMaps = sourceFolder
       ? buildFileUrlMapByName_(sourceFolder)
@@ -2622,12 +2623,12 @@ function fixSourceFileHyperlinksNow() {
   );
 }
 
-// Process log and maintenance
+// Logging and maintenance
 function logToTracker_(ss, fileInfo, result) {
   appendTrackerRowIfNotDuplicate_(ss, fileInfo, result, null);
 }
 
-// Append tracker row (skip if duplicate)
+// Append tracker row
 function appendTrackerRowIfNotDuplicate_(ss, fileInfo, result, processedMap) {
   try {
     const fileName = String(fileInfo.name || "").trim();
@@ -2637,8 +2638,8 @@ function appendTrackerRowIfNotDuplicate_(ss, fileInfo, result, processedMap) {
       return false;
     }
 
-    if (trackerHasProcessedEntry_(ss, fileInfo)) {
-      markProcessedInMap_(processedMap, fileInfo);
+    // Use processedMap fast path; fall back to tracker scan for standalone calls
+    if (!processedMap && trackerHasProcessedEntry_(ss, fileInfo)) {
       Logger.log("Tracker append skipped (already logged): " + fileName);
       return false;
     }
@@ -2665,7 +2666,7 @@ function appendTrackerRowIfNotDuplicate_(ss, fileInfo, result, processedMap) {
   }
 }
 
-// Extract month name from date
+// Get month name from date
 function extractMonthFromDate_(dateObj) {
   if (!dateObj) return "";
   const date = new Date(dateObj);
@@ -2695,7 +2696,7 @@ function shouldSkipFileForPerformance_(file) {
   return fileSize > fileSizeLimit;
 }
 
-// Performance logging helpers
+// Perf logging
 function ensurePerfSheetExists_() {
   const ss = getSpreadsheet_();
   if (!ss) return null;
@@ -2802,7 +2803,7 @@ function normalizeTrackerFileLinkColumnNow() {
       recoveredByName++;
     }
 
-    // fallback: normalized-key unique match
+    // Try normalized key
     if (!finalUrl && fileName) {
       const nk = normalizeFileKey_(fileName);
       if (nk && urlByNorm[nk] && urlByNorm[nk].length === 1) {
@@ -2863,7 +2864,7 @@ function buildFileUrlMapByName_(folder) {
   return { byName: byName, byNorm: byNorm, filesArr: filesArr };
 }
 
-// Fill missing Source File links
+// Backfill Source links
 function backfillMissingSourceLinks_(dryRun) {
   const ss = getSpreadsheet_();
   if (!ss) return "Bound spreadsheet not found.";
@@ -2979,7 +2980,7 @@ function backfillMissingSourceLinks_(dryRun) {
         outSources.push([formula]);
         updated++;
       } else if (candidates.length > 1) {
-        // Sort by matchCount descending
+        // Sort by match count desc
         candidates.sort(function (a, b) {
           return b.matchCount - a.matchCount;
         });
@@ -3085,7 +3086,7 @@ function backfillTrackerMonthsNow() {
     return;
   }
 
-  // Build map of files by name
+  // Build file name map
   const fileMap = {};
   const files = sourceFolder.getFiles();
   while (files.hasNext()) {
@@ -3861,6 +3862,7 @@ function runConsolidateForYear(year) {
       return "Source folder not found: " + CONFIG.sourceFolderName;
 
     const processedMap = loadProcessedMap_(ss);
+    const doneKeyMap = buildTrackerExactDoneKeyMap_(ss);
     const failedAttemptsMap = loadFailedAttemptsMap_(ss);
     const candidates = listCandidateFilesByYear_(
       sourceFolder,
@@ -3889,7 +3891,7 @@ function runConsolidateForYear(year) {
         continue;
       }
 
-      if (trackerHasProcessedEntry_(ss, fileInfo)) {
+      if (hasAnyProcessingKeyMatch_(doneKeyMap, fileInfo)) {
         markProcessedInMap_(processedMap, fileInfo);
         Logger.log(
           "Skipping file already present in tracker log: " + fileInfo.name,
@@ -4102,7 +4104,7 @@ function findOutputSheetByYear_(ss, year) {
       if (n === target || n.indexOf(target) !== -1) return sheets[i];
     }
 
-    // Create sheet if not found
+    // Create sheet if missing
     try {
       const created = ss.insertSheet(desiredName);
       if (created.getLastRow() === 0) {
