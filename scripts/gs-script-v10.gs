@@ -105,7 +105,7 @@ function clearPlaLookupMapCache_(ss) {
 }
 
 function getConfiguredYears_() {
-  // Get years from config sheet or default settings
+  // Load years from config
   const cfg = getConfigMappingsCached_() || {};
   const cfgYears = Object.keys(cfg || {})
     .map(function (k) {
@@ -130,7 +130,7 @@ function getEnrichmentForRow_(row, lookupMap) {
   var cleaned = "";
   var territory = "";
 
-  // Skip PLA lookup for OPEX transactions
+  // Skip PLA lookup for OPEX
   var wbsVal = row[COL["WBS Element"]];
   if (isOpexWbs_(wbsVal)) {
     territory = "OPEX";
@@ -141,7 +141,7 @@ function getEnrichmentForRow_(row, lookupMap) {
     return [regional, cleaned, territory, usdShort];
   }
 
-  // Look up by Installed PLA ID first, then PO PLA ID
+  // Try Installed PLA ID first, then PO PLA ID
   var installedKey = normalizePlaLookupKey_(row[COL["Installed PLA ID"]]);
   var found = installedKey ? lookupMap[installedKey] : null;
   if (!found) {
@@ -305,6 +305,10 @@ function onOpen() {
     .createMenu("Admin")
     .addItem("Check Lookup & Output Setup", "debugMainSiteSetup")
     .addItem("Clean Temp Files", "cleanupTempFiles")
+    .addSeparator()
+    .addItem("Cleanup Duplicates (Preview)", "cleanupDuplicatesPreview")
+    .addItem("Cleanup Duplicates (Now)", "cleanupDuplicatesNow")
+    .addSeparator()
     .addItem("Test One Source File (Debug)", "debugTestSingleFile");
 
   main
@@ -383,9 +387,21 @@ function stopAutomatic() {
 function consolidateGRTemplateData() {
   const startTime = Date.now();
   const lock = LockService.getScriptLock();
+  const docLock =
+    typeof LockService.getDocumentLock === "function"
+      ? LockService.getDocumentLock()
+      : null;
   const scriptProps = PropertiesService.getScriptProperties();
 
-  if (!lock.tryLock(5000)) {
+  const gotScriptLock = lock.tryLock(5000);
+  const gotDocLock = !docLock || docLock.tryLock(5000);
+  if (!gotScriptLock || !gotDocLock) {
+    try {
+      if (gotDocLock && docLock) docLock.releaseLock();
+    } catch (eDocLockAcquire) {}
+    try {
+      if (gotScriptLock) lock.releaseLock();
+    } catch (eLock) {}
     Logger.log("Another run is already in progress.");
     scriptProps.setProperty("LAST_RUN_STARTED_AT", new Date().toString());
     scriptProps.setProperty("LAST_RUN_FINISHED_AT", new Date().toString());
@@ -483,20 +499,16 @@ function consolidateGRTemplateData() {
       }
 
       const fileInfo = toProcess[i];
-      if (
-        processedMap[fileInfo.name] ||
-        processedMap[normalizeFileKey_(fileInfo.name)] ||
-        processedMap["__ID__" + fileInfo.id] ||
-        processedMap["__SOURCE_ID__" + fileInfo.id] ||
-        processedMap["__URL__" + normalizeDriveUrlForKey_(fileInfo.url)] ||
-        processedMap[
-          "__URL_ALT__" +
-            String(fileInfo.url || "")
-              .replace(/^https?:\/\//, "")
-              .replace(/\?.*$/, "")
-        ]
-      ) {
+      if (isMarkedProcessedInMap_(processedMap, fileInfo)) {
         Logger.log("Skipping already processed file: " + fileInfo.name);
+        continue;
+      }
+
+      if (trackerHasProcessedEntry_(ss, fileInfo)) {
+        markProcessedInMap_(processedMap, fileInfo);
+        Logger.log(
+          "Skipping file already present in tracker log: " + fileInfo.name,
+        );
         continue;
       }
 
@@ -504,7 +516,7 @@ function consolidateGRTemplateData() {
       scriptProps.setProperty("LAST_RUN_ACTIVE_YEAR", fileInfo.year);
       scriptProps.setProperty("LAST_RUN_STAGE", "Processing " + fileInfo.name);
 
-      // Skip large files to avoid timeouts
+      // Skip large files (>10 MB)
       try {
         const file = DriveApp.getFileById(fileInfo.id);
         if (shouldSkipFileForPerformance_(file)) {
@@ -520,17 +532,8 @@ function consolidateGRTemplateData() {
       const result = processSingleFile_(ss, fileInfo, tempFolder);
       appendTrackerRowIfNotDuplicate_(ss, fileInfo, result, processedMap);
 
-      if (String(result.status || "").toLowerCase() === "done") {
-        processedMap[fileInfo.name] = true;
-        processedMap[normalizeFileKey_(fileInfo.name)] = true;
-        processedMap["__ID__" + fileInfo.id] = true;
-        processedMap["__SOURCE_ID__" + fileInfo.id] = true;
-        const sourceUrl = String(fileInfo.url || "").trim();
-        processedMap["__URL__" + normalizeDriveUrlForKey_(sourceUrl)] = true;
-        processedMap[
-          "__URL_ALT__" +
-            sourceUrl.replace(/^https?:\/\//, "").replace(/\?.*$/, "")
-        ] = true;
+      if (isDoneStatus_(result.status)) {
+        markProcessedInMap_(processedMap, fileInfo);
       }
 
       processedCount++;
@@ -554,7 +557,10 @@ function consolidateGRTemplateData() {
     scriptProps.setProperty("LAST_RUN_STAGE", "Error");
     scriptProps.setProperty("LAST_RUN_FINISHED_AT", new Date().toString());
   } finally {
-    lock.releaseLock();
+    try {
+      if (docLock) docLock.releaseLock();
+    } catch (eDocLock) {}
+    if (lock) lock.releaseLock();
   }
 }
 
@@ -916,7 +922,7 @@ function addConfiguredYear(year, sheetName, spreadsheetId, createSheet) {
   const ss = getSpreadsheet_();
   if (!ss) return "Bound spreadsheet not found.";
   if (createSheet && !spreadsheetId) {
-    // create sheet in bound spreadsheet if not exists
+    // Create sheet if missing
     if (!ss.getSheetByName(sheetName)) ss.insertSheet(sheetName);
   }
   writeConfigMapping_(year, sheetName, spreadsheetId || "");
@@ -1049,7 +1055,7 @@ function listCandidateFilesByYear_(
   const maxTotal = CONFIG.maxFilesPerRunTotal;
 
   while (files.hasNext()) {
-    // compute current total across years
+    // Count files added so far
     var totalNow = 0;
     for (var k in candidates) totalNow += candidates[k].length;
     if (totalNow >= maxTotal) break;
@@ -1059,12 +1065,10 @@ function listCandidateFilesByYear_(
     const fileId = f.getId();
     const fileUrl = f.getUrl();
     const lower = name.toLowerCase();
+    const candidateInfo = { name: name, id: fileId, url: fileUrl };
 
     if (isTempArtifactName_(name)) continue;
-    if (processedMap[name]) continue;
-    if (processedMap[normalizeFileKey_(name)]) continue;
-    if (processedMap["__ID__" + fileId]) continue;
-    if (processedMap["__URL__" + normalizeDriveUrlForKey_(fileUrl)]) continue;
+    if (isMarkedProcessedInMap_(processedMap, candidateInfo)) continue;
     if ((failedAttemptsMap[name] || 0) >= CONFIG.maxFailedAttemptsPerFile)
       continue;
     if (lower.indexOf(".xlsx") === -1 && lower.indexOf(".xls") === -1) continue;
@@ -1115,38 +1119,37 @@ function loadProcessedMap_(ss) {
   if (!tracker || tracker.getLastRow() <= 1) return {};
 
   const map = {};
-  const data = tracker.getRange(2, 1, tracker.getLastRow() - 1, 7).getValues();
+  const rowCount = tracker.getLastRow() - 1;
+  let fileNameCol = getColumnIndexByHeader_(tracker, "File Name");
+  let statusCol = getColumnIndexByHeader_(tracker, "Status");
+  let fileLinkCol = getColumnIndexByHeader_(tracker, "File Link");
+  if (fileNameCol < 1) fileNameCol = 2;
+  if (statusCol < 1) statusCol = 6;
+  if (fileLinkCol < 1) fileLinkCol = 7;
 
-  data.forEach(function (row) {
-    const fileName = String(row[1] || "").trim();
-    const status = String(row[5] || "")
-      .trim()
-      .toLowerCase();
-    const fileUrl = String(row[6] || "").trim();
-    const isErrorLike = /^(error:|no data extracted|needs manual check)/i.test(
-      status,
-    );
-    if (!isErrorLike) {
-      map[fileName] = true;
-      map[normalizeFileKey_(fileName)] = true;
-    }
+  const fileNames = tracker
+    .getRange(2, fileNameCol, rowCount, 1)
+    .getDisplayValues();
+  const statuses = tracker
+    .getRange(2, statusCol, rowCount, 1)
+    .getDisplayValues();
+  const linkRange = tracker.getRange(2, fileLinkCol, rowCount, 1);
+  const linkValues = linkRange.getDisplayValues();
+  const linkFormulas = linkRange.getFormulas();
 
-    if (!isErrorLike && fileUrl) {
-      const idFromUrl = extractDriveIdFromUrl_(fileUrl);
-      if (idFromUrl) {
-        map["__ID__" + idFromUrl] = true;
-        map["__SOURCE_ID__" + idFromUrl] = true;
-      }
-      const urlKey = normalizeDriveUrlForKey_(fileUrl);
-      map["__URL__" + urlKey] = true;
-      map[
-        "__URL_ALT__" +
-          String(fileUrl || "")
-            .replace(/^https?:\/\//, "")
-            .replace(/\?.*$/, "")
-      ] = true;
-    }
-  });
+  for (var i = 0; i < rowCount; i++) {
+    const status = normalizeStatus_(statuses[i][0]);
+    if (!isProcessedStatus_(status)) continue;
+
+    const fileName = String(fileNames[i][0] || "").trim();
+    const fileUrl = extractUrlFromCell_(linkValues[i][0], linkFormulas[i][0]);
+
+    markProcessedInMap_(map, {
+      name: fileName,
+      id: extractDriveIdFromUrl_(fileUrl),
+      url: fileUrl,
+    });
+  }
 
   return map;
 }
@@ -1156,28 +1159,33 @@ function loadFailedAttemptsMap_(ss) {
   if (!tracker || tracker.getLastRow() <= 1) return {};
 
   const map = {};
-  const data = tracker.getRange(2, 1, tracker.getLastRow() - 1, 7).getValues();
+  const rowCount = tracker.getLastRow() - 1;
+  let fileNameCol = getColumnIndexByHeader_(tracker, "File Name");
+  let statusCol = getColumnIndexByHeader_(tracker, "Status");
+  if (fileNameCol < 1) fileNameCol = 2;
+  if (statusCol < 1) statusCol = 6;
 
-  data.forEach(function (row) {
-    const fileName = String(row[1] || "").trim();
-    const status = String(row[5] || "")
-      .trim()
-      .toLowerCase();
-    if (!fileName) return;
+  const fileNames = tracker
+    .getRange(2, fileNameCol, rowCount, 1)
+    .getDisplayValues();
+  const statuses = tracker
+    .getRange(2, statusCol, rowCount, 1)
+    .getDisplayValues();
 
-    if (status === "done" || status === "ok") {
+  for (var i = 0; i < rowCount; i++) {
+    const fileName = String(fileNames[i][0] || "").trim();
+    const status = normalizeStatus_(statuses[i][0]);
+    if (!fileName) continue;
+
+    if (isDoneStatus_(status)) {
       map[fileName] = 0;
-      return;
+      continue;
     }
 
-    if (
-      status.indexOf("no data extracted") === 0 ||
-      status.indexOf("error:") === 0 ||
-      status.indexOf("needs manual check") === 0
-    ) {
+    if (isFailureStatus_(status)) {
       map[fileName] = (map[fileName] || 0) + 1;
     }
-  });
+  }
 
   return map;
 }
@@ -1250,6 +1258,20 @@ function processSingleFile_(ss, fileInfo, tempFolder) {
       }
     }
 
+    if (outputSheetHasSourceFile_(outputSheet, fileInfo)) {
+      Logger.log(
+        "Skipping append; source already exists in output: " + fileInfo.name,
+      );
+      timings.totalMs = Date.now() - t0;
+      timings.rowsAdded = 0;
+      timings.status = CONFIG.doneStatusText + " (already in output)";
+      return {
+        rowsAdded: 0,
+        status: timings.status,
+        timings: timings,
+      };
+    }
+
     const tAppendStart = Date.now();
     appendRowsWithSourceLink_(outputSheet, rows, fileInfo, ss);
     timings.appendMs = Date.now() - tAppendStart;
@@ -1296,7 +1318,7 @@ function processSingleFile_(ss, fileInfo, tempFolder) {
   }
 }
 
-// Convert Excel file to temporary Google Sheet; throws NON_RETRIABLE_TOO_LARGE if file is too large for API
+// Convert Excel to temp sheet
 function convertExcelToTempSheet_(fileInfo, tempFolder) {
   const body = {
     title: "_TEMP_" + fileInfo.name,
@@ -1615,6 +1637,224 @@ function normalizeDriveUrlForKey_(url) {
   return String(url || "")
     .replace(/\?.*$/, "")
     .trim();
+}
+
+function normalizeStatus_(statusText) {
+  return String(statusText || "")
+    .trim()
+    .toLowerCase();
+}
+
+function isFailureStatus_(statusText) {
+  const s = normalizeStatus_(statusText);
+  return (
+    s.indexOf("no data extracted") === 0 ||
+    s.indexOf("error:") === 0 ||
+    s.indexOf("needs manual check") === 0
+  );
+}
+
+function isProcessedStatus_(statusText) {
+  const s = normalizeStatus_(statusText);
+  if (!s) return false;
+  return !isFailureStatus_(s);
+}
+
+function isDoneStatus_(statusText) {
+  const s = normalizeStatus_(statusText);
+  return s === "done" || s === "ok" || s.indexOf("done") === 0;
+}
+
+function normalizeUrlAltKey_(url) {
+  return String(url || "")
+    .replace(/^https?:\/\//i, "")
+    .replace(/\?.*$/, "")
+    .trim()
+    .toLowerCase();
+}
+
+function buildFileProcessingKeys_(fileInfo) {
+  const keys = [];
+  if (!fileInfo) return keys;
+
+  const fileName = String(fileInfo.name || "").trim();
+  if (fileName) {
+    keys.push(fileName);
+    const normalizedName = normalizeFileKey_(fileName);
+    if (normalizedName) keys.push(normalizedName);
+  }
+
+  const sourceUrl = String(fileInfo.url || "").trim();
+  const sourceId = String(fileInfo.id || "").trim() || extractDriveIdFromUrl_(sourceUrl);
+  if (sourceId) {
+    keys.push("__ID__" + sourceId);
+    keys.push("__SOURCE_ID__" + sourceId);
+  }
+
+  if (sourceUrl) {
+    keys.push("__URL__" + normalizeDriveUrlForKey_(sourceUrl));
+    const alt = normalizeUrlAltKey_(sourceUrl);
+    if (alt) keys.push("__URL_ALT__" + alt);
+  }
+
+  return keys;
+}
+
+function markProcessedInMap_(processedMap, fileInfo) {
+  if (!processedMap || !fileInfo) return;
+  const keys = buildFileProcessingKeys_(fileInfo);
+  for (var i = 0; i < keys.length; i++) {
+    if (keys[i]) processedMap[keys[i]] = true;
+  }
+}
+
+function isMarkedProcessedInMap_(processedMap, fileInfo) {
+  if (!processedMap || !fileInfo) return false;
+  const keys = buildFileProcessingKeys_(fileInfo);
+  for (var i = 0; i < keys.length; i++) {
+    if (keys[i] && processedMap[keys[i]]) return true;
+  }
+  return false;
+}
+
+function extractUrlFromCell_(displayValue, formulaValue) {
+  const fromFormula = extractUrlFromHyperlinkFormula_(formulaValue);
+  if (fromFormula) return fromFormula;
+
+  const text = String(displayValue || "").trim();
+  if (/^https?:\/\//i.test(text)) return text;
+  return "";
+}
+
+function hasAnyProcessingKeyMatch_(targetKeyMap, fileInfo) {
+  if (!targetKeyMap || !fileInfo) return false;
+  const keys = buildFileProcessingKeys_(fileInfo);
+  for (var i = 0; i < keys.length; i++) {
+    if (keys[i] && targetKeyMap[keys[i]]) return true;
+  }
+  return false;
+}
+
+function buildTrackerExactDoneKeyMap_(ss) {
+  if (!ss) return {};
+
+  const tracker = ss.getSheetByName(CONFIG.trackerSheetName);
+  if (!tracker || tracker.getLastRow() <= 1) return {};
+
+  const rowCount = tracker.getLastRow() - 1;
+  let fileNameCol = getColumnIndexByHeader_(tracker, "File Name");
+  let statusCol = getColumnIndexByHeader_(tracker, "Status");
+  let fileLinkCol = getColumnIndexByHeader_(tracker, "File Link");
+  if (fileNameCol < 1) fileNameCol = 2;
+  if (statusCol < 1) statusCol = 6;
+  if (fileLinkCol < 1) fileLinkCol = 7;
+
+  const fileNames = tracker
+    .getRange(2, fileNameCol, rowCount, 1)
+    .getDisplayValues();
+  const statuses = tracker
+    .getRange(2, statusCol, rowCount, 1)
+    .getDisplayValues();
+  const linkRange = tracker.getRange(2, fileLinkCol, rowCount, 1);
+  const linkValues = linkRange.getDisplayValues();
+  const linkFormulas = linkRange.getFormulas();
+
+  const doneKeyMap = {};
+  for (var i = 0; i < rowCount; i++) {
+    const status = normalizeStatus_(statuses[i][0]);
+    if (status !== "done") continue;
+
+    const rowUrl = extractUrlFromCell_(linkValues[i][0], linkFormulas[i][0]);
+    markProcessedInMap_(doneKeyMap, {
+      name: String(fileNames[i][0] || "").trim(),
+      id: extractDriveIdFromUrl_(rowUrl),
+      url: rowUrl,
+    });
+  }
+
+  return doneKeyMap;
+}
+
+function trackerHasExactDoneEntry_(ss, fileInfo, doneKeyMap) {
+  if (!ss || !fileInfo) return false;
+  const keyMap = doneKeyMap || buildTrackerExactDoneKeyMap_(ss);
+  return hasAnyProcessingKeyMatch_(keyMap, fileInfo);
+}
+
+function trackerHasProcessedEntry_(ss, fileInfo) {
+  if (!ss || !fileInfo) return false;
+
+  const tracker = ss.getSheetByName(CONFIG.trackerSheetName);
+  if (!tracker || tracker.getLastRow() <= 1) return false;
+
+  const rowCount = tracker.getLastRow() - 1;
+  let fileNameCol = getColumnIndexByHeader_(tracker, "File Name");
+  let statusCol = getColumnIndexByHeader_(tracker, "Status");
+  let fileLinkCol = getColumnIndexByHeader_(tracker, "File Link");
+  if (fileNameCol < 1) fileNameCol = 2;
+  if (statusCol < 1) statusCol = 6;
+  if (fileLinkCol < 1) fileLinkCol = 7;
+
+  const fileNames = tracker
+    .getRange(2, fileNameCol, rowCount, 1)
+    .getDisplayValues();
+  const statuses = tracker
+    .getRange(2, statusCol, rowCount, 1)
+    .getDisplayValues();
+  const linkRange = tracker.getRange(2, fileLinkCol, rowCount, 1);
+  const linkValues = linkRange.getDisplayValues();
+  const linkFormulas = linkRange.getFormulas();
+
+  const targetKeyMap = {};
+  buildFileProcessingKeys_(fileInfo).forEach(function (k) {
+    if (k) targetKeyMap[k] = true;
+  });
+
+  for (var i = 0; i < rowCount; i++) {
+    const status = normalizeStatus_(statuses[i][0]);
+    if (!isProcessedStatus_(status)) continue;
+
+    const rowUrl = extractUrlFromCell_(linkValues[i][0], linkFormulas[i][0]);
+    const rowFileInfo = {
+      name: String(fileNames[i][0] || "").trim(),
+      id: extractDriveIdFromUrl_(rowUrl),
+      url: rowUrl,
+    };
+
+    if (hasAnyProcessingKeyMatch_(targetKeyMap, rowFileInfo)) return true;
+  }
+
+  return false;
+}
+
+function outputSheetHasSourceFile_(sheet, fileInfo) {
+  if (!sheet || !fileInfo || sheet.getLastRow() <= 1) return false;
+
+  const sourceCol = getColumnIndexByHeader_(sheet, CONFIG.sourceHeaderName);
+  if (sourceCol < 1) return false;
+
+  const rowCount = sheet.getLastRow() - 1;
+  const sourceRange = sheet.getRange(2, sourceCol, rowCount, 1);
+  const sourceValues = sourceRange.getDisplayValues();
+  const sourceFormulas = sourceRange.getFormulas();
+
+  const targetKeyMap = {};
+  buildFileProcessingKeys_(fileInfo).forEach(function (k) {
+    if (k) targetKeyMap[k] = true;
+  });
+
+  for (var i = 0; i < rowCount; i++) {
+    const sourceText = String(sourceValues[i][0] || "").trim();
+    const sourceUrl = extractUrlFromCell_(sourceText, sourceFormulas[i][0]);
+    const existing = {
+      name: sourceText,
+      id: extractDriveIdFromUrl_(sourceUrl),
+      url: sourceUrl,
+    };
+    if (hasAnyProcessingKeyMatch_(targetKeyMap, existing)) return true;
+  }
+
+  return false;
 }
 
 function extractPoHintFromFileName_(fileName) {
@@ -2266,7 +2506,7 @@ function convertAmountToUsdForAllData() {
   );
 }
 
-// Convert plain Source File text to HYPERLINK formulas
+// Convert text to hyperlink formulas
 function fixSourceFileHyperlinksNow() {
   const ss = getSpreadsheet_();
   if (!ss) {
@@ -2301,7 +2541,7 @@ function fixSourceFileHyperlinksNow() {
     const values = range.getDisplayValues();
     const formulas = range.getFormulas();
 
-    // Build file maps for lookups (exact name and normalized name)
+    // Map files by name
     const sourceFolder = findFolder_(CONFIG.sourceFolderName);
     const fileMaps = sourceFolder
       ? buildFileUrlMapByName_(sourceFolder)
@@ -2384,63 +2624,23 @@ function fixSourceFileHyperlinksNow() {
 
 // Process log and maintenance
 function logToTracker_(ss, fileInfo, result) {
-  const tracker = ss.getSheetByName(CONFIG.trackerSheetName);
-  if (!tracker) return;
-  const sourceUrl = String(fileInfo.url || "").trim();
-  const existingRows = tracker
-    .getRange(2, 1, tracker.getLastRow() - 1, 7)
-    .getValues();
-  const fileName = String(fileInfo.name || "").trim();
-  const sourceFileId = extractDriveIdFromUrl_(sourceUrl);
-  const urlKey = normalizeDriveUrlForKey_(sourceUrl);
-  for (let i = 0; i < existingRows.length; i++) {
-    const row = existingRows[i];
-    const existingFileId = extractDriveIdFromUrl_(String(row[6] || "").trim());
-    const existingUrlKey = normalizeDriveUrlForKey_(
-      String(row[6] || "").trim(),
-    );
-    if (
-      String(row[1] || "").trim() === fileName ||
-      existingFileId === sourceFileId ||
-      existingUrlKey === urlKey
-    ) {
-      Logger.log("Skipping duplicate: " + fileName);
-      return;
-    }
-  }
-
-  const month = extractMonthFromDate_(fileInfo.dateCreated);
-  tracker.appendRow([
-    new Date(),
-    fileInfo.name,
-    month,
-    fileInfo.year,
-    result.rowsAdded,
-    result.status,
-    sourceUrl,
-  ]);
+  appendTrackerRowIfNotDuplicate_(ss, fileInfo, result, null);
 }
 
-// Append tracker row using the in-memory processedMap to avoid scanning the whole tracker sheet
+// Append tracker row (skip if duplicate)
 function appendTrackerRowIfNotDuplicate_(ss, fileInfo, result, processedMap) {
   try {
     const fileName = String(fileInfo.name || "").trim();
     const sourceUrl = String(fileInfo.url || "").trim();
-    if (processedMap) {
-      if (
-        processedMap[fileName] ||
-        processedMap[normalizeFileKey_(fileName)] ||
-        processedMap["__ID__" + fileInfo.id] ||
-        processedMap["__SOURCE_ID__" + fileInfo.id] ||
-        processedMap["__URL__" + normalizeDriveUrlForKey_(sourceUrl)] ||
-        processedMap[
-          "__URL_ALT__" +
-            sourceUrl.replace(/^https?:\/\//, "").replace(/\?.*$/, "")
-        ]
-      ) {
-        Logger.log("Tracker append skipped duplicate: " + fileName);
-        return false;
-      }
+    if (isMarkedProcessedInMap_(processedMap, fileInfo)) {
+      Logger.log("Tracker append skipped duplicate: " + fileName);
+      return false;
+    }
+
+    if (trackerHasProcessedEntry_(ss, fileInfo)) {
+      markProcessedInMap_(processedMap, fileInfo);
+      Logger.log("Tracker append skipped (already logged): " + fileName);
+      return false;
     }
 
     const tracker = ss.getSheetByName(CONFIG.trackerSheetName);
@@ -2455,6 +2655,9 @@ function appendTrackerRowIfNotDuplicate_(ss, fileInfo, result, processedMap) {
       result.status,
       sourceUrl,
     ]);
+    if (isDoneStatus_(result.status)) {
+      markProcessedInMap_(processedMap, fileInfo);
+    }
     return true;
   } catch (e) {
     Logger.log("appendTrackerRowIfNotDuplicate_ error: " + (e && e.message));
@@ -2462,7 +2665,7 @@ function appendTrackerRowIfNotDuplicate_(ss, fileInfo, result, processedMap) {
   }
 }
 
-// Helper: Extract full month name from a Date object (e.g., "March")
+// Extract month name from date
 function extractMonthFromDate_(dateObj) {
   if (!dateObj) return "";
   const date = new Date(dateObj);
@@ -2484,7 +2687,7 @@ function extractMonthFromDate_(dateObj) {
   return monthNames[monthIndex] || "";
 }
 
-// Helper: Check if file should be skipped due to size (>10 MB)
+// Skip files over 10 MB
 function shouldSkipFileForPerformance_(file) {
   if (!file) return false;
   const fileSizeLimit = 10 * 1024 * 1024; // 10 MB in bytes
@@ -2660,7 +2863,7 @@ function buildFileUrlMapByName_(folder) {
   return { byName: byName, byNorm: byNorm, filesArr: filesArr };
 }
 
-// Backfill helper: fill missing "Source File" links by matching tokens
+// Fill missing Source File links
 function backfillMissingSourceLinks_(dryRun) {
   const ss = getSpreadsheet_();
   if (!ss) return "Bound spreadsheet not found.";
@@ -2776,7 +2979,7 @@ function backfillMissingSourceLinks_(dryRun) {
         outSources.push([formula]);
         updated++;
       } else if (candidates.length > 1) {
-        // sort by matchCount descending; if top is unique, choose it
+        // Sort by matchCount descending
         candidates.sort(function (a, b) {
           return b.matchCount - a.matchCount;
         });
@@ -2901,7 +3104,7 @@ function backfillTrackerMonthsNow() {
     const fileName = String(fileNames[i][0] || "").trim();
     let month = "";
 
-    // Try to find the file and get its creation date
+    // Get file creation date
     if (fileName && fileMap[fileName]) {
       try {
         const file = fileMap[fileName];
@@ -2934,14 +3137,16 @@ function requeueNoDataFiles() {
   const tracker = ss.getSheetByName(CONFIG.trackerSheetName);
   if (!tracker || tracker.getLastRow() <= 1) return;
 
-  const data = tracker.getRange(2, 1, tracker.getLastRow() - 1, 5).getValues();
+  let statusCol = getColumnIndexByHeader_(tracker, "Status");
+  if (statusCol < 1) statusCol = 6;
+  const data = tracker
+    .getRange(2, statusCol, tracker.getLastRow() - 1, 1)
+    .getDisplayValues();
   let removed = 0;
 
   for (let i = data.length - 1; i >= 0; i--) {
-    const status = String(data[i][4] || "")
-      .trim()
-      .toLowerCase();
-    if (status !== "ok" && status !== "done") {
+    const status = normalizeStatus_(data[i][0]);
+    if (!isDoneStatus_(status)) {
       tracker.deleteRow(i + 2);
       removed++;
     }
@@ -2973,6 +3178,515 @@ function cleanupTempFiles() {
   Logger.log("Temp files cleaned: " + count);
   const ss = getSpreadsheet_();
   if (ss) ss.toast("Cleaned " + count + " temp file(s).", "GR Automation", 8);
+}
+
+function cleanupDuplicatesPreview() {
+  return cleanupDuplicates_(true);
+}
+
+function cleanupDuplicatesNow() {
+  try {
+    const ui = SpreadsheetApp.getUi();
+    const r = ui.alert(
+      "Cleanup Duplicates",
+      "This will remove duplicate rows from the tracker and output sheets. Continue?",
+      ui.ButtonSet.YES_NO,
+    );
+    if (r !== ui.Button.YES) {
+      const msg = "Cleanup cancelled.";
+      notify_(msg);
+      return msg;
+    }
+  } catch (eUi) {}
+
+  return cleanupDuplicates_(false);
+}
+
+function cleanupDuplicates_(dryRun) {
+  const ss = getSpreadsheet_();
+  if (!ss) {
+    const msg = "No spreadsheet found.";
+    notify_(msg);
+    return msg;
+  }
+
+  const lock = LockService.getScriptLock();
+  const docLock =
+    typeof LockService.getDocumentLock === "function"
+      ? LockService.getDocumentLock()
+      : null;
+
+  const gotScriptLock = lock.tryLock(5000);
+  const gotDocLock = !docLock || docLock.tryLock(5000);
+  if (!gotScriptLock || !gotDocLock) {
+    try {
+      if (gotDocLock && docLock) docLock.releaseLock();
+    } catch (eDocLockAcquire) {}
+    try {
+      if (gotScriptLock) lock.releaseLock();
+    } catch (eLockAcquire) {}
+    const msg =
+      "Another run is active. Please retry cleanup after current processing completes.";
+    notify_(msg);
+    return msg;
+  }
+
+  try {
+    const notes = [];
+    let trackerPlan = {
+      duplicateGroupCount: 0,
+      deleteRows: [],
+      previewExamples: [],
+    };
+    const doneTrackerKeyMap = buildTrackerExactDoneKeyMap_(ss);
+
+    const tracker = ss.getSheetByName(CONFIG.trackerSheetName);
+    if (tracker && tracker.getLastRow() > 1) {
+      trackerPlan = buildTrackerDuplicateCleanupPlan_(tracker);
+    } else {
+      notes.push("Tracker not found or has no data rows.");
+    }
+
+    const years = getConfiguredYears_();
+    const outputPlans = [];
+    let outputGroupCount = 0;
+    let outputDeleteCount = 0;
+
+    years.forEach(function (year) {
+      const sh = findOutputSheetByYear_(ss, year);
+      if (!sh || sh.getLastRow() <= 1) {
+        notes.push(String(year) + ": skipped (sheet missing or empty).");
+        return;
+      }
+
+      const plan = buildOutputDuplicateCleanupPlan_(
+        ss,
+        sh,
+        year,
+        doneTrackerKeyMap,
+      );
+      outputPlans.push(plan);
+      outputGroupCount += plan.duplicateGroupCount;
+      outputDeleteCount += plan.deleteRows.length;
+    });
+
+    let removedTracker = 0;
+    let removedOutput = 0;
+    if (!dryRun) {
+      removedTracker = deleteRowsInReverse_(tracker, trackerPlan.deleteRows);
+      outputPlans.forEach(function (plan) {
+        plan.deletedCount = deleteRowsInReverse_(plan.sheet, plan.deleteRows);
+        removedOutput += plan.deletedCount;
+      });
+    }
+
+    notes.push(
+      "Tracker duplicates: groups=" +
+        trackerPlan.duplicateGroupCount +
+        ", rows " +
+        (dryRun ? "to remove=" : "removed=") +
+        (dryRun ? trackerPlan.deleteRows.length : removedTracker),
+    );
+
+    if (dryRun && trackerPlan.previewExamples.length > 0) {
+      notes.push("Tracker examples (keep row -> remove rows):");
+      trackerPlan.previewExamples.forEach(function (line) {
+        notes.push("  " + line);
+      });
+    }
+
+    notes.push(
+      "Output duplicates: groups=" +
+        outputGroupCount +
+        ", rows " +
+        (dryRun ? "to remove=" : "removed=") +
+        (dryRun ? outputDeleteCount : removedOutput),
+    );
+
+    outputPlans.forEach(function (plan) {
+      notes.push(
+        plan.sheet.getName() +
+          ": groups=" +
+          plan.duplicateGroupCount +
+          ", rows " +
+          (dryRun ? "to remove=" : "removed=") +
+          (dryRun ? plan.deleteRows.length : plan.deletedCount || 0),
+      );
+
+      if (dryRun && plan.previewExamples && plan.previewExamples.length > 0) {
+        notes.push(plan.sheet.getName() + " examples (keep row -> remove rows):");
+        plan.previewExamples.forEach(function (line) {
+          notes.push("  " + line);
+        });
+      }
+    });
+
+    if (!dryRun) {
+      notes.push(
+        "Total rows removed: " + String(removedTracker + removedOutput) + ".",
+      );
+    } else {
+      notes.push(
+        "Total rows to remove: " +
+          String(trackerPlan.deleteRows.length + outputDeleteCount) +
+          ".",
+      );
+    }
+
+    const header = dryRun
+      ? "Duplicate cleanup preview complete."
+      : "Duplicate cleanup complete.";
+    const summary = header + "\n\n" + notes.join("\n");
+    notify_(summary);
+    return summary;
+  } catch (e) {
+    const msg = "Duplicate cleanup failed: " + e.message;
+    notify_(msg);
+    throw e;
+  } finally {
+    try {
+      if (docLock) docLock.releaseLock();
+    } catch (eDocLock) {}
+    try {
+      lock.releaseLock();
+    } catch (eLock) {}
+  }
+}
+
+function buildTrackerDuplicateCleanupPlan_(tracker) {
+  const rowCount = tracker.getLastRow() - 1;
+  const lastCol = Math.max(7, tracker.getLastColumn());
+  const values = tracker.getRange(2, 1, rowCount, lastCol).getValues();
+  const display = tracker.getRange(2, 1, rowCount, lastCol).getDisplayValues();
+  const formulas = tracker.getRange(2, 1, rowCount, lastCol).getFormulas();
+
+  let tsCol = getColumnIndexByHeader_(tracker, "Timestamp");
+  let fileNameCol = getColumnIndexByHeader_(tracker, "File Name");
+  let fileLinkCol = getColumnIndexByHeader_(tracker, "File Link");
+  let statusCol = getColumnIndexByHeader_(tracker, "Status");
+  if (tsCol < 1) tsCol = 1;
+  if (fileNameCol < 1) fileNameCol = 2;
+  if (fileLinkCol < 1) fileLinkCol = 7;
+  if (statusCol < 1) statusCol = 6;
+
+  const groups = {};
+  for (let i = 0; i < rowCount; i++) {
+    const status = normalizeStatus_(display[i][statusCol - 1]);
+    if (status !== "done") continue;
+
+    const rowNum = i + 2;
+    const fileName = String(display[i][fileNameCol - 1] || "").trim();
+    const linkText = String(display[i][fileLinkCol - 1] || "").trim();
+    const linkFormula = formulas[i][fileLinkCol - 1];
+    const linkUrl = extractUrlFromCell_(linkText, linkFormula);
+    const key = buildTrackerDuplicateKey_(fileName, linkUrl);
+    if (!key) continue;
+
+    const tsMs = toTimestampMs_(values[i][tsCol - 1], display[i][tsCol - 1]);
+    if (!groups[key]) groups[key] = { doneRows: [] };
+    groups[key].doneRows.push({
+      rowNum: rowNum,
+      rowDisplay: display[i],
+      tsMs: tsMs,
+    });
+  }
+
+  const deleteRows = [];
+  let duplicateGroupCount = 0;
+  const previewGroups = {};
+
+  Object.keys(groups).forEach(function (k) {
+    const g = groups[k];
+    const doneRows = g.doneRows || [];
+    if (doneRows.length <= 1) return;
+
+    let keep = doneRows[0];
+    for (let i = 1; i < doneRows.length; i++) {
+      const row = doneRows[i];
+      if (
+        shouldKeepNewTrackerRow_(keep.rowNum, keep.tsMs, row.rowNum, row.tsMs)
+      ) {
+        keep = row;
+      }
+    }
+
+    const duplicates = [];
+    doneRows.forEach(function (row) {
+      if (row.rowNum === keep.rowNum) return;
+      deleteRows.push(row.rowNum);
+      duplicates.push({
+        rowNum: row.rowNum,
+        rowDisplay: row.rowDisplay,
+      });
+    });
+
+    if (duplicates.length === 0) return;
+    duplicateGroupCount++;
+    previewGroups[k] = {
+      keepRowNum: keep.rowNum,
+      duplicates: duplicates,
+    };
+  });
+
+  const previewExamples = buildDuplicatePreviewExamples_(previewGroups, 5, 8);
+
+  return {
+    duplicateGroupCount: duplicateGroupCount,
+    deleteRows: deleteRows,
+    previewExamples: previewExamples,
+  };
+}
+
+function buildOutputDuplicateCleanupPlan_(ss, sheet, year, doneTrackerKeyMap) {
+  const sourceCol = getColumnIndexByHeader_(sheet, CONFIG.sourceHeaderName);
+  if (sourceCol < 1) {
+    return {
+      year: year,
+      sheet: sheet,
+      duplicateGroupCount: 0,
+      deleteRows: [],
+      previewExamples: [],
+    };
+  }
+
+  const rowCount = sheet.getLastRow() - 1;
+  const lastCol = sheet.getLastColumn();
+  const display = sheet.getRange(2, 1, rowCount, lastCol).getDisplayValues();
+  const formulas = sheet.getRange(2, 1, rowCount, lastCol).getFormulas();
+
+  const groups = {};
+  for (let i = 0; i < rowCount; i++) {
+    const rowNum = i + 2;
+    const sourceText = String(display[i][sourceCol - 1] || "").trim();
+    const sourceUrl = extractUrlFromCell_(sourceText, formulas[i][sourceCol - 1]);
+    const key = buildSourceDuplicateKey_(sourceText, sourceUrl);
+    if (!key) continue;
+
+    const existing = groups[key];
+    if (!existing) {
+      groups[key] = {
+        keepRowNum: rowNum,
+        keepIndex: i,
+        duplicates: [],
+        sourceText: sourceText,
+        sourceUrl: sourceUrl,
+      };
+      continue;
+    }
+
+    if (!existing.sourceText && sourceText) existing.sourceText = sourceText;
+    if (!existing.sourceUrl && sourceUrl) existing.sourceUrl = sourceUrl;
+
+    existing.duplicates.push({
+      rowNum: existing.keepRowNum,
+      rowDisplay: display[existing.keepIndex],
+    });
+    existing.keepRowNum = rowNum;
+    existing.keepIndex = i;
+  }
+
+  const deleteRows = [];
+  let duplicateGroupCount = 0;
+  const previewGroups = {};
+
+  Object.keys(groups).forEach(function (k) {
+    const g = groups[k];
+    if (!g.duplicates || g.duplicates.length === 0) return;
+
+    const fileInfo = {
+      name: String(g.sourceText || "").trim(),
+      id: extractDriveIdFromUrl_(g.sourceUrl),
+      url: String(g.sourceUrl || "").trim(),
+    };
+    if (!trackerHasExactDoneEntry_(ss, fileInfo, doneTrackerKeyMap)) return;
+
+    duplicateGroupCount++;
+    g.duplicates.forEach(function (d) {
+      deleteRows.push(d.rowNum);
+    });
+
+    previewGroups[k] = {
+      keepRowNum: g.keepRowNum,
+      duplicates: g.duplicates,
+    };
+  });
+
+  const previewExamples = buildDuplicatePreviewExamples_(previewGroups, 5, 8);
+
+  return {
+    year: year,
+    sheet: sheet,
+    duplicateGroupCount: duplicateGroupCount,
+    deleteRows: deleteRows,
+    previewExamples: previewExamples,
+  };
+}
+
+function buildDuplicatePreviewExamples_(groups, groupLimit, rowLimit) {
+  const examples = [];
+  const keys = Object.keys(groups || {});
+
+  for (let i = 0; i < keys.length; i++) {
+    if (examples.length >= groupLimit) break;
+
+    const key = keys[i];
+    const g = groups[key];
+    if (!g || !g.duplicates || g.duplicates.length === 0) continue;
+
+    const rows = g.duplicates
+      .map(function (d) {
+        return Number(d.rowNum);
+      })
+      .filter(function (n) {
+        return !isNaN(n) && n >= 2;
+      })
+      .sort(function (a, b) {
+        return a - b;
+      });
+
+    if (rows.length === 0) continue;
+
+    const shown = rows.slice(0, rowLimit);
+    let removeRowsText = shown.join(", ");
+    if (rows.length > rowLimit) removeRowsText += ", ...";
+
+    examples.push(
+      "keep row " +
+        g.keepRowNum +
+        " -> remove rows " +
+        removeRowsText +
+        " (key " +
+        shortenPreviewKey_(key, 48) +
+        ")",
+    );
+  }
+
+  return examples;
+}
+
+function shortenPreviewKey_(key, maxLen) {
+  const s = String(key || "");
+  const n = Number(maxLen) || 48;
+  if (s.length <= n) return s;
+  if (n <= 3) return s.substring(0, n);
+  return s.substring(0, n - 3) + "...";
+}
+
+function buildTrackerDuplicateKey_(fileName, fileUrl) {
+  const fileId = extractDriveIdFromUrl_(fileUrl);
+  if (fileId) return "id:" + fileId;
+
+  const normalizedName = normalizeFileKey_(fileName);
+  if (normalizedName) return "name:" + normalizedName;
+
+  const normalizedUrl = normalizeDriveUrlForKey_(fileUrl);
+  if (normalizedUrl) return "url:" + normalizedUrl;
+
+  return "";
+}
+
+function buildSourceDuplicateKey_(sourceText, sourceUrl) {
+  const sourceId = extractDriveIdFromUrl_(sourceUrl);
+  if (sourceId) return "id:" + sourceId;
+
+  const normalizedUrl = normalizeDriveUrlForKey_(sourceUrl);
+  if (normalizedUrl) return "url:" + normalizedUrl;
+
+  const normalizedName = normalizeFileKey_(sourceText);
+  if (normalizedName) return "name:" + normalizedName;
+
+  return "";
+}
+
+function toTimestampMs_(value, displayValue) {
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    if (!isNaN(ms)) return ms;
+  }
+
+  const parsed = Date.parse(String(displayValue || value || ""));
+  return isNaN(parsed) ? NaN : parsed;
+}
+
+function shouldKeepNewTrackerRow_(keepRowNum, keepTsMs, rowNum, tsMs) {
+  const keepHasTs = typeof keepTsMs === "number" && !isNaN(keepTsMs);
+  const rowHasTs = typeof tsMs === "number" && !isNaN(tsMs);
+  if (keepHasTs && rowHasTs) {
+    if (tsMs === keepTsMs) return rowNum > keepRowNum;
+    return tsMs > keepTsMs;
+  }
+  return rowNum > keepRowNum;
+}
+
+function deleteRowsInReverse_(sheet, rows) {
+  if (!sheet || !rows || rows.length === 0) return 0;
+
+  const unique = {};
+  for (let i = 0; i < rows.length; i++) {
+    const r = Number(rows[i]);
+    if (r >= 2) unique[r] = true;
+  }
+
+  const sorted = Object.keys(unique)
+    .map(function (k) {
+      return Number(k);
+    })
+    .sort(function (a, b) {
+      return b - a;
+    });
+
+  for (let i = 0; i < sorted.length; i++) {
+    sheet.deleteRow(sorted[i]);
+  }
+
+  return sorted.length;
+}
+
+function writeCleanupBackupSheet_(ss, records) {
+  if (!ss || !records || records.length === 0) return "";
+
+  const tz = Session.getScriptTimeZone() || "GMT";
+  const stamp = Utilities.formatDate(new Date(), tz, "yyyyMMdd-HHmmss");
+  const baseName = "Duplicate Cleanup Backup " + stamp;
+
+  let name = baseName;
+  let suffix = 2;
+  while (ss.getSheetByName(name)) {
+    name = baseName + "-" + suffix;
+    suffix++;
+  }
+
+  const sh = ss.insertSheet(name);
+  const header = [
+    "Source Sheet",
+    "Original Row",
+    "Duplicate Key",
+    "Kept Row",
+    "Row Snapshot",
+  ];
+  sh.getRange(1, 1, 1, header.length).setValues([header]);
+
+  const values = records.map(function (r) {
+    return [
+      r.sourceSheet || "",
+      r.rowNumber || "",
+      r.duplicateKey || "",
+      r.keptRowNumber || "",
+      (r.rowDisplay || [])
+        .map(function (c) {
+          return String(c || "");
+        })
+        .join(" | "),
+    ];
+  });
+
+  if (values.length > 0) {
+    sh.getRange(2, 1, values.length, header.length).setValues(values);
+  }
+  sh.setFrozenRows(1);
+  sh.autoResizeColumns(1, header.length);
+
+  return name;
 }
 
 // Notification
@@ -3092,7 +3806,7 @@ function debugMainSiteSetup() {
   notify_(msg.join("\n"));
 }
 
-// UI: show modal picker to process a specific year
+// Year picker modal
 function showYearPicker() {
   const html = HtmlService.createHtmlOutput(
     '<div style="font-family: Arial, sans-serif; padding:12px;">' +
@@ -3122,8 +3836,21 @@ function getConfiguredYearsForUi() {
 function runConsolidateForYear(year) {
   const startTime = Date.now();
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(5000))
+  const docLock =
+    typeof LockService.getDocumentLock === "function"
+      ? LockService.getDocumentLock()
+      : null;
+  const gotScriptLock = lock.tryLock(5000);
+  const gotDocLock = !docLock || docLock.tryLock(5000);
+  if (!gotScriptLock || !gotDocLock) {
+    try {
+      if (gotDocLock && docLock) docLock.releaseLock();
+    } catch (eDocLockAcquire) {}
+    try {
+      if (gotScriptLock) lock.releaseLock();
+    } catch (eLock) {}
     return "Another run is already in progress. Try again later.";
+  }
   try {
     const ss = getSpreadsheet_();
     if (!ss) return "Target spreadsheet not found. Run setup first.";
@@ -3157,41 +3884,25 @@ function runConsolidateForYear(year) {
       }
 
       const fileInfo = toProcess[i];
-      if (
-        processedMap[fileInfo.name] ||
-        processedMap[normalizeFileKey_(fileInfo.name)] ||
-        processedMap["__ID__" + fileInfo.id] ||
-        processedMap["__SOURCE_ID__" + fileInfo.id] ||
-        processedMap["__URL__" + normalizeDriveUrlForKey_(fileInfo.url)] ||
-        processedMap[
-          "__URL_ALT__" +
-            String(fileInfo.url || "")
-              .replace(/^https?:\/\//, "")
-              .replace(/\?.*$/, "")
-        ]
-      ) {
+      if (isMarkedProcessedInMap_(processedMap, fileInfo)) {
         Logger.log("Skipping already processed file: " + fileInfo.name);
+        continue;
+      }
+
+      if (trackerHasProcessedEntry_(ss, fileInfo)) {
+        markProcessedInMap_(processedMap, fileInfo);
+        Logger.log(
+          "Skipping file already present in tracker log: " + fileInfo.name,
+        );
         continue;
       }
 
       const result = processSingleFile_(ss, fileInfo, tempFolder);
       appendTrackerRowIfNotDuplicate_(ss, fileInfo, result, processedMap);
 
-      const st = String(result.status || "").toLowerCase();
-      if (
-        st.indexOf("done") === 0 ||
-        st.indexOf("needs manual check") === 0
-      ) {
-        processedMap[fileInfo.name] = true;
-        processedMap[normalizeFileKey_(fileInfo.name)] = true;
-        processedMap["__ID__" + fileInfo.id] = true;
-        processedMap["__SOURCE_ID__" + fileInfo.id] = true;
-        const sourceUrl = String(fileInfo.url || "").trim();
-        processedMap["__URL__" + normalizeDriveUrlForKey_(sourceUrl)] = true;
-        processedMap[
-          "__URL_ALT__" +
-            sourceUrl.replace(/^https?:\/\//, "").replace(/\?.*$/, "")
-        ] = true;
+      const st = normalizeStatus_(result.status);
+      if (isDoneStatus_(st) || st.indexOf("needs manual check") === 0) {
+        markProcessedInMap_(processedMap, fileInfo);
       }
 
       processedCount++;
@@ -3203,6 +3914,9 @@ function runConsolidateForYear(year) {
     Logger.log("runConsolidateForYear error: " + (e && e.message));
     return "Error: " + (e && e.message ? e.message : String(e));
   } finally {
+    try {
+      if (docLock) docLock.releaseLock();
+    } catch (er2) {}
     try {
       lock.releaseLock();
     } catch (er) {}
@@ -3388,7 +4102,7 @@ function findOutputSheetByYear_(ss, year) {
       if (n === target || n.indexOf(target) !== -1) return sheets[i];
     }
 
-    // If not found in controller, try creating in controller as last resort
+    // Create sheet if not found
     try {
       const created = ss.insertSheet(desiredName);
       if (created.getLastRow() === 0) {
