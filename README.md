@@ -1,4 +1,4 @@
-﻿# GR Template Automation Consolidator
+# GR Template Automation Consolidator
 
 **Version:** 1.0 | **Status:** Production | **Last Updated:** April 17, 2026
 
@@ -171,13 +171,13 @@ gs-automation-consolidator/
 ┌─────────────────────────────────────────────────────────────┐
 │      CLEANUP: Delete temporary files                        │
 │      (Move temp sheet to Drive Trash)                       │
-└─────────────────────────────────────────────────────────────┘
+└─────────────────────┬───────────────────────────────────────┘
+```
 
 CONTROL:
 - Manual: Click "Process All New Files Now"
 - Automatic: 1-minute time-based trigger
 - Per-year: Click "Process Files for Year..."
-```
 
 ## Configuration
 
@@ -225,7 +225,7 @@ The script creates and populates these sheets:
 Contains consolidated GR data with columns:
 - Standard columns: Acceptance Date, PO No., Material Description, Installed Qty, etc.
 - Enrichment columns: Regional Area, Cleaned Site Name, Territory, Amount To Billed (USD)
-- Source File: Hyperlink to original Excel file
+- Source File: Hyperlink to original file
 
 ### 2. Processed Files Log (audit trail)
 Tracks every file processed:
@@ -475,5 +475,3 @@ This project is internal to [For Revision]. All rights reserved.
 **For detailed documentation, start with the [USER_MANUAL_GR_CONSOLIDATION.md](./docs/USER_MANUAL_GR_CONSOLIDATION.md)**
 
 ---
-
-
