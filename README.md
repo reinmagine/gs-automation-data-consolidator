@@ -1,14 +1,14 @@
 # GR Template Automation Consolidator
 
-**Version:** 1.0 | **Status:** Production | **Last Updated:** April 17, 2026
+**Version:** 1.0 | **Last Updated:** April 20, 2026
 
-A powerful Google Apps Script automation system for consolidating Goods Receipt (GR) data from multiple Excel files into unified, enriched Google Sheets.
+A Google Apps Script automation system for consolidating Goods Receipt (GR) data from multiple Excel files into unified, Google Sheets.
 
 ## Overview
 
 This project automates the processing of GR (Goods Receipt) templates from a Drive folder, extracting data into consolidated sheets with automatic enrichment (PLA lookup, currency conversion, territory mapping).
 
-**Key Features:**
+**Features:**
 - Batch conversion of Excel files to Google Sheets
 - Intelligent header detection and column mapping (with aliases)
 - Advanced row filtering (skips summaries, merged cells, hidden rows)
@@ -460,8 +460,8 @@ When reporting a problem, include:
 
 ## Resources
 
-- **[User Manual](./docs/USER_MANUAL_GR_CONSOLIDATION.md)** — Complete guide for end users
-- **[Code Guide](./docs/ANNOTATED_CODE_GUIDE.md)** — Technical deep-dive for developers
+- **[User Manual](./docs/USER_MANUAL_GR_CONSOLIDATION.md)** — Guide
+- **[Code Guide](./docs/ANNOTATED_CODE_GUIDE.md)** — Devs
 - **[Script Reference](./docs/SCRIPT_REFERENCE.csv)** — Per-function documentation
 - **[Google Apps Script Documentation](https://developers.google.com/apps-script)**
 - **[Google Sheets API Reference](https://developers.google.com/sheets/api)**
