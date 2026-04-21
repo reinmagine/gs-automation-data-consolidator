@@ -1265,7 +1265,7 @@ function processSingleFile_(ss, fileInfo, tempFolder) {
       );
       timings.totalMs = Date.now() - t0;
       timings.rowsAdded = 0;
-      timings.status = CONFIG.doneStatusText + " (already in output)";
+      timings.status = CONFIG.doneStatusText;
       return {
         rowsAdded: 0,
         status: timings.status,
