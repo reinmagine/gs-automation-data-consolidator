@@ -16,9 +16,18 @@ const CONFIG = {
   ],
   usdConversionRate: 57,
   triggerMinutes: 1,
-  maxFilesPerRunTotal: 6,
-  maxFilesPerRunPerYear: 3,
-  maxRuntimeMs: 120000,
+  maxFilesPerRunTotal: 12,
+  maxFilesPerRunPerYear: 6,
+  maxRuntimeMs: 240000,
+  preferLastUpdatedForYearFallback: true,
+  allowDateYearFallbackWhenNameMissing: true,
+  useIncrementalSourceScan: true,
+  incrementalScanLookbackHours: 24,
+  incrementalScanOverlapMinutes: 15,
+  incrementalScanPageSize: 250,
+  incrementalScanMaxFilesToInspect: 2000,
+  forceFullScanEveryRuns: 30,
+  fullScanMaxFilesToInspect: 0,
   headerScanMaxRows: 80,
   maxRowsPerSheetScan: 2500,
   maxColsPerSheetScan: 45,
@@ -451,8 +460,15 @@ function consolidateGRTemplateData() {
     const processedMap = loadProcessedMap_(ss);
     const doneKeyMap = buildTrackerExactDoneKeyMap_(ss);
     const failedAttemptsMap = loadFailedAttemptsMap_(ss);
+
+    const scanState = listSourceFilesForScan_(sourceFolder, scriptProps);
+    scriptProps.setProperty(
+      "LAST_RUN_SCAN_MODE",
+      scanState.mode + (scanState.sinceIso ? " (since " + scanState.sinceIso + ")" : ""),
+    );
+
     const candidates = listCandidateFilesByYear_(
-      sourceFolder,
+      scanState.files,
       processedMap,
       failedAttemptsMap,
     );
@@ -1017,31 +1033,271 @@ function isTempArtifactName_(name) {
   );
 }
 
+function getConfiguredYearFromDate_(dateObj, yearsSet) {
+  if (!(dateObj instanceof Date)) return null;
+  const y = String(dateObj.getFullYear());
+  return yearsSet[y] ? y : null;
+}
+
+function toValidDate_(value) {
+  if (value instanceof Date) {
+    return isNaN(value.getTime()) ? null : value;
+  }
+  if (value === null || value === undefined || value === "") return null;
+  const d = new Date(value);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function getFileNameSafe_(file) {
+  if (!file) return "";
+  try {
+    if (typeof file.getName === "function") return String(file.getName() || "");
+  } catch (e) {}
+  if (file.name !== undefined) return String(file.name || "");
+  if (file.title !== undefined) return String(file.title || "");
+  return "";
+}
+
+function getFileIdSafe_(file) {
+  if (!file) return "";
+  try {
+    if (typeof file.getId === "function") return String(file.getId() || "");
+  } catch (e) {}
+  return String(file.id || "");
+}
+
+function getFileUrlSafe_(file) {
+  if (!file) return "";
+  try {
+    if (typeof file.getUrl === "function") return String(file.getUrl() || "");
+  } catch (e) {}
+
+  if (file.url !== undefined && file.url !== null) return String(file.url);
+  if (file.alternateLink) return String(file.alternateLink);
+  if (file.webViewLink) return String(file.webViewLink);
+
+  const id = getFileIdSafe_(file);
+  return id ? "https://drive.google.com/open?id=" + id : "";
+}
+
+function getFileLastUpdatedSafe_(file) {
+  if (!file) return null;
+  try {
+    if (typeof file.getLastUpdated === "function") {
+      return toValidDate_(file.getLastUpdated());
+    }
+  } catch (e) {
+    // Continue to property fallback.
+  }
+  return toValidDate_(file.modifiedDate || file.modifiedTime || null);
+}
+
+function getFileDateCreatedSafe_(file) {
+  if (!file) return null;
+  try {
+    if (typeof file.getDateCreated === "function") {
+      return toValidDate_(file.getDateCreated());
+    }
+  } catch (e) {
+    // Continue to property fallback.
+  }
+  return toValidDate_(file.createdDate || file.createdTime || null);
+}
+
+function getBestFileDateForMetadata_(file) {
+  return getFileLastUpdatedSafe_(file) || getFileDateCreatedSafe_(file);
+}
+
+function normalizeDriveApiFileItem_(item) {
+  if (!item) return null;
+
+  const id = String(item.id || "");
+  const name = String(item.title || item.name || "");
+  const url = String(
+    item.alternateLink ||
+      item.webViewLink ||
+      (id ? "https://drive.google.com/open?id=" + id : ""),
+  );
+
+  return {
+    id: id,
+    name: name,
+    url: url,
+    createdDate: toValidDate_(item.createdDate || item.createdTime),
+    modifiedDate: toValidDate_(item.modifiedDate || item.modifiedTime),
+  };
+}
+
 function detectYearFromNameOrFileDate_(file) {
-  const name = String(file.getName() || "");
+  const name = getFileNameSafe_(file);
   const years = getConfiguredYears_();
+  const yearsSet = {};
+  for (var yi = 0; yi < years.length; yi++) {
+    yearsSet[years[yi]] = true;
+  }
 
   for (var i = 0; i < years.length; i++) {
     if (name.indexOf(years[i]) !== -1) return years[i];
   }
 
-  let d = null;
-  try {
-    d = file.getDateCreated();
-  } catch (e) {}
+  if (CONFIG.allowDateYearFallbackWhenNameMissing === false) return null;
 
-  if (d instanceof Date) {
-    const y = String(d.getFullYear());
-    for (var j = 0; j < years.length; j++) {
-      if (y === years[j]) return years[j];
-    }
+  var primaryDate =
+    CONFIG.preferLastUpdatedForYearFallback === false
+      ? getFileDateCreatedSafe_(file)
+      : getFileLastUpdatedSafe_(file);
+  var secondaryDate =
+    CONFIG.preferLastUpdatedForYearFallback === false
+      ? getFileLastUpdatedSafe_(file)
+      : getFileDateCreatedSafe_(file);
+
+  var y = getConfiguredYearFromDate_(primaryDate, yearsSet);
+  if (y) return y;
+
+  return getConfiguredYearFromDate_(secondaryDate, yearsSet);
+}
+
+function listSourceFilesFull_(sourceFolder) {
+  const out = [];
+  if (!sourceFolder) return out;
+
+  const maxInspect = Math.max(0, Number(CONFIG.fullScanMaxFilesToInspect) || 0);
+  const files = sourceFolder.getFiles();
+
+  while (files.hasNext()) {
+    const f = files.next();
+    out.push({
+      id: getFileIdSafe_(f),
+      name: getFileNameSafe_(f),
+      url: getFileUrlSafe_(f),
+      createdDate: getFileDateCreatedSafe_(f),
+      modifiedDate: getFileLastUpdatedSafe_(f),
+    });
+
+    if (maxInspect > 0 && out.length >= maxInspect) break;
   }
 
-  return null;
+  return out;
+}
+
+function listSourceFilesIncremental_(sourceFolder, sinceDate) {
+  const out = [];
+  if (!sourceFolder) return out;
+
+  const folderId = sourceFolder.getId();
+  const pageSize = Math.max(
+    50,
+    Math.min(1000, Number(CONFIG.incrementalScanPageSize) || 250),
+  );
+  const maxInspect = Math.max(
+    1,
+    Number(CONFIG.incrementalScanMaxFilesToInspect) || 2000,
+  );
+
+  const qParts = ["'" + folderId + "' in parents", "trashed = false"];
+  if (sinceDate instanceof Date && !isNaN(sinceDate.getTime())) {
+    qParts.push("modifiedDate >= '" + sinceDate.toISOString() + "'");
+  }
+  const query = qParts.join(" and ");
+
+  let pageToken = null;
+  do {
+    const resp = Drive.Files.list({
+      q: query,
+      maxResults: pageSize,
+      pageToken: pageToken,
+      orderBy: "modifiedDate desc",
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+    });
+
+    const items = resp && resp.items ? resp.items : [];
+    for (let i = 0; i < items.length; i++) {
+      const normalized = normalizeDriveApiFileItem_(items[i]);
+      if (!normalized || !normalized.id || !normalized.name) continue;
+      out.push(normalized);
+      if (out.length >= maxInspect) break;
+    }
+
+    if (out.length >= maxInspect) break;
+    pageToken = resp && resp.nextPageToken ? resp.nextPageToken : null;
+  } while (pageToken);
+
+  return out;
+}
+
+function listSourceFilesForScan_(sourceFolder, scriptProps, options) {
+  scriptProps = scriptProps || PropertiesService.getScriptProperties();
+  options = options || {};
+
+  const now = new Date();
+  const runCountKey = "SOURCE_SCAN_RUN_COUNT";
+  const lastAtKey = "SOURCE_SCAN_LAST_AT";
+
+  let runCount = Number(scriptProps.getProperty(runCountKey) || "0");
+  runCount++;
+  scriptProps.setProperty(runCountKey, String(runCount));
+
+  const useIncremental = CONFIG.useIncrementalSourceScan !== false;
+  const forceFullByOption = options.forceFull === true;
+  const fullEveryRuns = Math.max(1, Number(CONFIG.forceFullScanEveryRuns) || 30);
+  const shouldUseFull =
+    forceFullByOption || !useIncremental || runCount % fullEveryRuns === 0;
+
+  let mode = "full";
+  let sinceDate = null;
+  let files = [];
+
+  if (!shouldUseFull) {
+    mode = "incremental";
+
+    const lookbackHours = Math.max(
+      1,
+      Number(CONFIG.incrementalScanLookbackHours) || 24,
+    );
+    const overlapMinutes = Math.max(
+      0,
+      Number(CONFIG.incrementalScanOverlapMinutes) || 15,
+    );
+
+    sinceDate = toValidDate_(scriptProps.getProperty(lastAtKey));
+    if (!sinceDate) {
+      sinceDate = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
+    }
+    sinceDate = new Date(sinceDate.getTime() - overlapMinutes * 60 * 1000);
+
+    try {
+      files = listSourceFilesIncremental_(sourceFolder, sinceDate);
+    } catch (eInc) {
+      Logger.log(
+        "Incremental scan failed, fallback to full scan: " +
+          (eInc && eInc.message),
+      );
+      mode = "full-fallback";
+      files = listSourceFilesFull_(sourceFolder);
+    }
+  } else {
+    files = listSourceFilesFull_(sourceFolder);
+  }
+
+  scriptProps.setProperty(lastAtKey, now.toISOString());
+  scriptProps.setProperty("SOURCE_SCAN_LAST_MODE", mode);
+  scriptProps.setProperty("SOURCE_SCAN_LAST_FILE_COUNT", String(files.length));
+  if (sinceDate) {
+    scriptProps.setProperty("SOURCE_SCAN_LAST_SINCE", sinceDate.toISOString());
+  } else {
+    scriptProps.deleteProperty("SOURCE_SCAN_LAST_SINCE");
+  }
+
+  return {
+    files: files,
+    mode: mode,
+    sinceIso: sinceDate ? sinceDate.toISOString() : "",
+  };
 }
 
 function listCandidateFilesByYear_(
-  sourceFolder,
+  sourceFiles,
   processedMap,
   failedAttemptsMap,
 ) {
@@ -1051,20 +1307,18 @@ function listCandidateFilesByYear_(
     candidates[y] = [];
   });
 
-  const files = sourceFolder.getFiles();
+  const files = Array.isArray(sourceFiles) ? sourceFiles : [];
   const maxPerYear = CONFIG.maxFilesPerRunPerYear;
   const maxTotal = CONFIG.maxFilesPerRunTotal;
+  let totalNow = 0;
 
-  while (files.hasNext()) {
-    // Check files per year limit
-    var totalNow = 0;
-    for (var k in candidates) totalNow += candidates[k].length;
-    if (totalNow >= maxTotal) break;
+  for (let idx = 0; idx < files.length && totalNow < maxTotal; idx++) {
+    const f = files[idx];
+    const name = getFileNameSafe_(f);
+    const fileId = getFileIdSafe_(f);
+    const fileUrl = getFileUrlSafe_(f);
+    if (!name || !fileId) continue;
 
-    const f = files.next();
-    const name = f.getName();
-    const fileId = f.getId();
-    const fileUrl = f.getUrl();
     const lower = name.toLowerCase();
     const candidateInfo = { name: name, id: fileId, url: fileUrl };
 
@@ -1083,8 +1337,9 @@ function listCandidateFilesByYear_(
       name: name,
       year: year,
       url: fileUrl,
-      dateCreated: f.getDateCreated(),
+      dateCreated: getBestFileDateForMetadata_(f),
     });
+    totalNow++;
   }
 
   return candidates;
@@ -1686,7 +1941,8 @@ function buildFileProcessingKeys_(fileInfo) {
   }
 
   const sourceUrl = String(fileInfo.url || "").trim();
-  const sourceId = String(fileInfo.id || "").trim() || extractDriveIdFromUrl_(sourceUrl);
+  const sourceId =
+    String(fileInfo.id || "").trim() || extractDriveIdFromUrl_(sourceUrl);
   if (sourceId) {
     keys.push("__ID__" + sourceId);
     keys.push("__SOURCE_ID__" + sourceId);
@@ -3238,8 +3494,8 @@ function cleanupDuplicates_(dryRun) {
       duplicateGroupCount: 0,
       deleteRows: [],
       previewExamples: [],
+      duplicateRuns: [],
     };
-    const doneTrackerKeyMap = buildTrackerExactDoneKeyMap_(ss);
 
     const tracker = ss.getSheetByName(CONFIG.trackerSheetName);
     if (tracker && tracker.getLastRow() > 1) {
@@ -3248,25 +3504,13 @@ function cleanupDuplicates_(dryRun) {
       notes.push("Tracker not found or has no data rows.");
     }
 
-    const years = getConfiguredYears_();
-    const outputPlans = [];
+    const outputPlans = buildOutputDuplicateCleanupPlansFromTracker_(
+      ss,
+      trackerPlan,
+    );
     let outputGroupCount = 0;
     let outputDeleteCount = 0;
-
-    years.forEach(function (year) {
-      const sh = findOutputSheetByYear_(ss, year);
-      if (!sh || sh.getLastRow() <= 1) {
-        notes.push(String(year) + ": skipped (sheet missing or empty).");
-        return;
-      }
-
-      const plan = buildOutputDuplicateCleanupPlan_(
-        ss,
-        sh,
-        year,
-        doneTrackerKeyMap,
-      );
-      outputPlans.push(plan);
+    outputPlans.forEach(function (plan) {
       outputGroupCount += plan.duplicateGroupCount;
       outputDeleteCount += plan.deleteRows.length;
     });
@@ -3289,6 +3533,17 @@ function cleanupDuplicates_(dryRun) {
         (dryRun ? trackerPlan.deleteRows.length : removedTracker),
     );
 
+    const trackerRunsWithRows = (trackerPlan.duplicateRuns || []).filter(
+      function (run) {
+        return Number(run.rowsAdded || 0) > 0;
+      },
+    ).length;
+    notes.push(
+      "Tracker duplicate run entries with Rows Added > 0: " +
+        trackerRunsWithRows +
+        ".",
+    );
+
     if (dryRun && trackerPlan.previewExamples.length > 0) {
       notes.push("Tracker examples (keep row -> remove rows):");
       trackerPlan.previewExamples.forEach(function (line) {
@@ -3301,7 +3556,8 @@ function cleanupDuplicates_(dryRun) {
         outputGroupCount +
         ", rows " +
         (dryRun ? "to remove=" : "removed=") +
-        (dryRun ? outputDeleteCount : removedOutput),
+        (dryRun ? outputDeleteCount : removedOutput) +
+        " (safe match: source + row signature)",
     );
 
     outputPlans.forEach(function (plan) {
@@ -3315,8 +3571,17 @@ function cleanupDuplicates_(dryRun) {
       );
 
       if (dryRun && plan.previewExamples && plan.previewExamples.length > 0) {
-        notes.push(plan.sheet.getName() + " examples (keep row -> remove rows):");
+        notes.push(
+          plan.sheet.getName() + " examples (keep row -> remove rows):",
+        );
         plan.previewExamples.forEach(function (line) {
+          notes.push("  " + line);
+        });
+      }
+
+      if (plan.warnings && plan.warnings.length > 0) {
+        notes.push(plan.sheet.getName() + " warnings:");
+        plan.warnings.forEach(function (line) {
           notes.push("  " + line);
         });
       }
@@ -3365,10 +3630,14 @@ function buildTrackerDuplicateCleanupPlan_(tracker) {
   let fileNameCol = getColumnIndexByHeader_(tracker, "File Name");
   let fileLinkCol = getColumnIndexByHeader_(tracker, "File Link");
   let statusCol = getColumnIndexByHeader_(tracker, "Status");
+  let yearCol = getColumnIndexByHeader_(tracker, "Year");
+  let rowsAddedCol = getColumnIndexByHeader_(tracker, "Rows Added");
   if (tsCol < 1) tsCol = 1;
   if (fileNameCol < 1) fileNameCol = 2;
   if (fileLinkCol < 1) fileLinkCol = 7;
   if (statusCol < 1) statusCol = 6;
+  if (yearCol < 1) yearCol = 4;
+  if (rowsAddedCol < 1) rowsAddedCol = 5;
 
   const groups = {};
   for (let i = 0; i < rowCount; i++) {
@@ -3384,17 +3653,27 @@ function buildTrackerDuplicateCleanupPlan_(tracker) {
     if (!key) continue;
 
     const tsMs = toTimestampMs_(values[i][tsCol - 1], display[i][tsCol - 1]);
+    const year = String(display[i][yearCol - 1] || values[i][yearCol - 1] || "");
+    const rowsAdded = toNonNegativeInt_(
+      values[i][rowsAddedCol - 1],
+      display[i][rowsAddedCol - 1],
+    );
     if (!groups[key]) groups[key] = { doneRows: [] };
     groups[key].doneRows.push({
       rowNum: rowNum,
       rowDisplay: display[i],
       tsMs: tsMs,
+      fileName: fileName,
+      fileUrl: linkUrl,
+      year: year,
+      rowsAdded: rowsAdded,
     });
   }
 
   const deleteRows = [];
   let duplicateGroupCount = 0;
   const previewGroups = {};
+  const duplicateRuns = [];
 
   Object.keys(groups).forEach(function (k) {
     const g = groups[k];
@@ -3418,6 +3697,17 @@ function buildTrackerDuplicateCleanupPlan_(tracker) {
       duplicates.push({
         rowNum: row.rowNum,
         rowDisplay: row.rowDisplay,
+        rowsAdded: row.rowsAdded,
+      });
+      duplicateRuns.push({
+        duplicateKey: k,
+        trackerRowNum: row.rowNum,
+        keepTrackerRowNum: keep.rowNum,
+        fileName: row.fileName,
+        fileUrl: row.fileUrl,
+        year: String(row.year || "").trim(),
+        rowsAdded: row.rowsAdded,
+        tsMs: row.tsMs,
       });
     });
 
@@ -3435,92 +3725,232 @@ function buildTrackerDuplicateCleanupPlan_(tracker) {
     duplicateGroupCount: duplicateGroupCount,
     deleteRows: deleteRows,
     previewExamples: previewExamples,
+    duplicateRuns: duplicateRuns,
   };
 }
 
-function buildOutputDuplicateCleanupPlan_(ss, sheet, year, doneTrackerKeyMap) {
+function buildOutputDuplicateCleanupPlansFromTracker_(ss, trackerPlan) {
+  const runs =
+    trackerPlan && trackerPlan.duplicateRuns ? trackerPlan.duplicateRuns : [];
+
+  const groupedBySource = {};
+  runs.forEach(function (run) {
+    const rowsAdded = Number(run.rowsAdded || 0);
+    const year = String(run.year || "").trim();
+    const sourceKey = buildSourceDuplicateKey_(run.fileName, run.fileUrl);
+    if (!year || rowsAdded <= 0 || !sourceKey) return;
+
+    const groupKey = year + "|" + sourceKey;
+    if (!groupedBySource[groupKey]) {
+      groupedBySource[groupKey] = {
+        year: year,
+        sourceKey: sourceKey,
+        sourceText: String(run.fileName || "").trim(),
+        sourceUrl: String(run.fileUrl || "").trim(),
+        rowsToDelete: 0,
+      };
+    }
+    groupedBySource[groupKey].rowsToDelete += rowsAdded;
+  });
+
+  const plansBySheet = {};
+  Object.keys(groupedBySource).forEach(function (groupKey) {
+    const g = groupedBySource[groupKey];
+    const sh = findOutputSheetByYear_(ss, g.year);
+    if (!sh || sh.getLastRow() <= 1) return;
+
+    const sourcePlan = buildOutputDuplicateRowsForSource_(
+      sh,
+      g.sourceText,
+      g.sourceUrl,
+      g.rowsToDelete,
+    );
+
+    const sheetName = sh.getName();
+    if (!plansBySheet[sheetName]) {
+      plansBySheet[sheetName] = {
+        year: g.year,
+        sheet: sh,
+        duplicateGroupCount: 0,
+        deleteRows: [],
+        previewExamples: [],
+        warnings: [],
+      };
+    }
+
+    const plan = plansBySheet[sheetName];
+    if (sourcePlan.deleteRows.length > 0) {
+      plan.duplicateGroupCount++;
+      plan.deleteRows = plan.deleteRows.concat(sourcePlan.deleteRows);
+      if (sourcePlan.previewExample) {
+        plan.previewExamples.push(sourcePlan.previewExample);
+      }
+    }
+    if (sourcePlan.warning) plan.warnings.push(sourcePlan.warning);
+  });
+
+  return Object.keys(plansBySheet).map(function (sheetName) {
+    const plan = plansBySheet[sheetName];
+    const uniqueRows = {};
+    plan.deleteRows.forEach(function (r) {
+      const n = Number(r);
+      if (!isNaN(n) && n >= 2) uniqueRows[n] = true;
+    });
+    plan.deleteRows = Object.keys(uniqueRows)
+      .map(function (k) {
+        return Number(k);
+      })
+      .sort(function (a, b) {
+        return a - b;
+      });
+    return plan;
+  });
+}
+
+function buildOutputDuplicateRowsForSource_(
+  sheet,
+  sourceText,
+  sourceUrl,
+  rowsToDeleteTarget,
+) {
+  const result = {
+    deleteRows: [],
+    previewExample: "",
+    warning: "",
+  };
+
+  const targetCount = Math.max(0, Number(rowsToDeleteTarget) || 0);
+  if (targetCount < 1 || !sheet || sheet.getLastRow() <= 1) return result;
+
   const sourceCol = getColumnIndexByHeader_(sheet, CONFIG.sourceHeaderName);
   if (sourceCol < 1) {
-    return {
-      year: year,
-      sheet: sheet,
-      duplicateGroupCount: 0,
-      deleteRows: [],
-      previewExamples: [],
-    };
+    result.warning =
+      "Source File column not found for " + sheet.getName() + ".";
+    return result;
   }
+
+  const targetKey = buildSourceDuplicateKey_(sourceText, sourceUrl);
+  if (!targetKey) return result;
 
   const rowCount = sheet.getLastRow() - 1;
   const lastCol = sheet.getLastColumn();
   const display = sheet.getRange(2, 1, rowCount, lastCol).getDisplayValues();
   const formulas = sheet.getRange(2, 1, rowCount, lastCol).getFormulas();
 
-  const groups = {};
+  const matches = [];
   for (let i = 0; i < rowCount; i++) {
-    const rowNum = i + 2;
-    const sourceText = String(display[i][sourceCol - 1] || "").trim();
-    const sourceUrl = extractUrlFromCell_(sourceText, formulas[i][sourceCol - 1]);
-    const key = buildSourceDuplicateKey_(sourceText, sourceUrl);
-    if (!key) continue;
+    const sourceCellText = String(display[i][sourceCol - 1] || "").trim();
+    const sourceCellUrl = extractUrlFromCell_(
+      sourceCellText,
+      formulas[i][sourceCol - 1],
+    );
+    const sourceKey = buildSourceDuplicateKey_(sourceCellText, sourceCellUrl);
+    if (sourceKey !== targetKey) continue;
 
-    const existing = groups[key];
-    if (!existing) {
-      groups[key] = {
-        keepRowNum: rowNum,
-        keepIndex: i,
-        duplicates: [],
-        sourceText: sourceText,
-        sourceUrl: sourceUrl,
-      };
-      continue;
-    }
-
-    if (!existing.sourceText && sourceText) existing.sourceText = sourceText;
-    if (!existing.sourceUrl && sourceUrl) existing.sourceUrl = sourceUrl;
-
-    existing.duplicates.push({
-      rowNum: existing.keepRowNum,
-      rowDisplay: display[existing.keepIndex],
+    matches.push({
+      rowNum: i + 2,
+      signature: buildOutputRowSignature_(display[i]),
     });
-    existing.keepRowNum = rowNum;
-    existing.keepIndex = i;
   }
 
-  const deleteRows = [];
-  let duplicateGroupCount = 0;
-  const previewGroups = {};
+  if (matches.length <= 1) return result;
 
-  Object.keys(groups).forEach(function (k) {
-    const g = groups[k];
-    if (!g.duplicates || g.duplicates.length === 0) return;
-
-    const fileInfo = {
-      name: String(g.sourceText || "").trim(),
-      id: extractDriveIdFromUrl_(g.sourceUrl),
-      url: String(g.sourceUrl || "").trim(),
-    };
-    if (!trackerHasExactDoneEntry_(ss, fileInfo, doneTrackerKeyMap)) return;
-
-    duplicateGroupCount++;
-    g.duplicates.forEach(function (d) {
-      deleteRows.push(d.rowNum);
-    });
-
-    previewGroups[k] = {
-      keepRowNum: g.keepRowNum,
-      duplicates: g.duplicates,
-    };
+  const signatureRows = {};
+  matches.forEach(function (m) {
+    if (!signatureRows[m.signature]) signatureRows[m.signature] = [];
+    signatureRows[m.signature].push(m.rowNum);
   });
 
-  const previewExamples = buildDuplicatePreviewExamples_(previewGroups, 5, 8);
+  Object.keys(signatureRows).forEach(function (sig) {
+    signatureRows[sig].sort(function (a, b) {
+      return a - b;
+    });
+  });
 
-  return {
-    year: year,
-    sheet: sheet,
-    duplicateGroupCount: duplicateGroupCount,
-    deleteRows: deleteRows,
-    previewExamples: previewExamples,
-  };
+  const latestFirst = matches.slice().sort(function (a, b) {
+    return b.rowNum - a.rowNum;
+  });
+
+  const deleteRows = [];
+  for (let i = 0; i < latestFirst.length; i++) {
+    if (deleteRows.length >= targetCount) break;
+
+    const row = latestFirst[i];
+    const sigList = signatureRows[row.signature] || [];
+    if (sigList.length <= 1) continue;
+
+    const idx = sigList.lastIndexOf(row.rowNum);
+    if (idx <= 0) continue;
+
+    sigList.splice(idx, 1);
+    deleteRows.push(row.rowNum);
+  }
+
+  if (deleteRows.length === 0) {
+    result.warning =
+      "No safe duplicate rows found for key " +
+      shortenPreviewKey_(targetKey, 48) +
+      ".";
+    return result;
+  }
+
+  const sortedDeleteRows = deleteRows.slice().sort(function (a, b) {
+    return a - b;
+  });
+  result.deleteRows = sortedDeleteRows;
+
+  const shown = sortedDeleteRows.slice(0, 8);
+  let removeRowsText = shown.join(", ");
+  if (sortedDeleteRows.length > 8) removeRowsText += ", ...";
+
+  const keepCandidates = matches
+    .map(function (m) {
+      return m.rowNum;
+    })
+    .filter(function (n) {
+      return sortedDeleteRows.indexOf(n) === -1;
+    })
+    .sort(function (a, b) {
+      return a - b;
+    });
+  const keepRowNum = keepCandidates.length ? keepCandidates[0] : matches[0].rowNum;
+
+  result.previewExample =
+    "keep row " +
+    keepRowNum +
+    " -> remove rows " +
+    removeRowsText +
+    " (key " +
+    shortenPreviewKey_(targetKey, 48) +
+    ")";
+
+  if (sortedDeleteRows.length < targetCount) {
+    result.warning =
+      "Requested remove=" +
+      targetCount +
+      " but only " +
+      sortedDeleteRows.length +
+      " safe duplicate row(s) matched for key " +
+      shortenPreviewKey_(targetKey, 36) +
+      ".";
+  }
+
+  return result;
+}
+
+function buildOutputRowSignature_(rowDisplay) {
+  const row = rowDisplay || [];
+  const coreLen = Math.min(COLUMN_MAPPING.length, row.length);
+  const parts = [];
+  for (let i = 0; i < coreLen; i++) {
+    parts.push(
+      String(row[i] || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase(),
+    );
+  }
+  return parts.join("|");
 }
 
 function buildDuplicatePreviewExamples_(groups, groupLimit, rowLimit) {
@@ -3599,6 +4029,19 @@ function buildSourceDuplicateKey_(sourceText, sourceUrl) {
   return "";
 }
 
+function toNonNegativeInt_(value, displayValue) {
+  let n = Number(value);
+  if (isNaN(n)) {
+    n = Number(
+      String(displayValue || "")
+        .replace(/,/g, "")
+        .replace(/[^0-9.-]/g, ""),
+    );
+  }
+  if (isNaN(n) || n < 0) return 0;
+  return Math.floor(n);
+}
+
 function toTimestampMs_(value, displayValue) {
   if (value instanceof Date) {
     const ms = value.getTime();
@@ -3613,10 +4056,10 @@ function shouldKeepNewTrackerRow_(keepRowNum, keepTsMs, rowNum, tsMs) {
   const keepHasTs = typeof keepTsMs === "number" && !isNaN(keepTsMs);
   const rowHasTs = typeof tsMs === "number" && !isNaN(tsMs);
   if (keepHasTs && rowHasTs) {
-    if (tsMs === keepTsMs) return rowNum > keepRowNum;
-    return tsMs > keepTsMs;
+    if (tsMs === keepTsMs) return rowNum < keepRowNum;
+    return tsMs < keepTsMs;
   }
-  return rowNum > keepRowNum;
+  return rowNum < keepRowNum;
 }
 
 function deleteRowsInReverse_(sheet, rows) {
@@ -3855,6 +4298,7 @@ function runConsolidateForYear(year) {
   try {
     const ss = getSpreadsheet_();
     if (!ss) return "Target spreadsheet not found. Run setup first.";
+    const scriptProps = PropertiesService.getScriptProperties();
     ensureSheets_(ss);
 
     const sourceFolder = findFolder_(CONFIG.sourceFolderName);
@@ -3864,14 +4308,19 @@ function runConsolidateForYear(year) {
     const processedMap = loadProcessedMap_(ss);
     const doneKeyMap = buildTrackerExactDoneKeyMap_(ss);
     const failedAttemptsMap = loadFailedAttemptsMap_(ss);
+
+    const scanState = listSourceFilesForScan_(sourceFolder, scriptProps, {
+      forceFull: true,
+    });
+
     const candidates = listCandidateFilesByYear_(
-      sourceFolder,
+      scanState.files,
       processedMap,
       failedAttemptsMap,
     );
 
     if (!candidates || !candidates[year] || candidates[year].length === 0) {
-      return "No candidate files found for " + year;
+      return "No candidate files found for " + year + " (scan mode: " + scanState.mode + ")";
     }
 
     const toProcess = candidates[year].slice(0, CONFIG.maxFilesPerRunPerYear);
@@ -3911,7 +4360,15 @@ function runConsolidateForYear(year) {
       totalRowsAdded += result.rowsAdded;
     }
 
-    return "Done: files=" + processedCount + ", rows=" + totalRowsAdded;
+    return (
+      "Done: files=" +
+      processedCount +
+      ", rows=" +
+      totalRowsAdded +
+      " (scan mode: " +
+      scanState.mode +
+      ")"
+    );
   } catch (e) {
     Logger.log("runConsolidateForYear error: " + (e && e.message));
     return "Error: " + (e && e.message ? e.message : String(e));
@@ -3944,6 +4401,7 @@ function debugAutoProcessingStatus() {
   let blockedByFailedAttempts = 0;
   let pending = 0;
   const sampleNoYear = [];
+  const years = getConfiguredYears_();
 
   const sourceFolder = findFolder_(CONFIG.sourceFolderName);
   if (sourceFolder) {
@@ -3961,11 +4419,10 @@ function debugAutoProcessingStatus() {
 
       totalExcel++;
 
-      const years = getConfiguredYears_();
-      const hasYear = years.some(function (y) {
-        return name.indexOf(y) !== -1;
-      });
-      if (!hasYear) {
+      const fileId = f.getId();
+      const fileUrl = f.getUrl();
+      const detectedYear = detectYearFromNameOrFileDate_(f);
+      if (!detectedYear) {
         noYear++;
         if (sampleNoYear.length < 5) sampleNoYear.push(name);
         continue;
@@ -3973,7 +4430,9 @@ function debugAutoProcessingStatus() {
 
       withYear++;
 
-      if (processedMap[name]) {
+      const fileInfo = { name: name, id: fileId, url: fileUrl };
+
+      if (isMarkedProcessedInMap_(processedMap, fileInfo)) {
         alreadyDone++;
         continue;
       }
@@ -4003,14 +4462,22 @@ function debugAutoProcessingStatus() {
     "Last stage: " + (scriptProps.getProperty("LAST_RUN_STAGE") || "N/A"),
     "Last candidate counts: " +
       (scriptProps.getProperty("LAST_RUN_CANDIDATES") || "N/A"),
+    "Last scan mode: " +
+      (scriptProps.getProperty("LAST_RUN_SCAN_MODE") ||
+        scriptProps.getProperty("SOURCE_SCAN_LAST_MODE") ||
+        "N/A"),
+    "Last scanned file list size: " +
+      (scriptProps.getProperty("SOURCE_SCAN_LAST_FILE_COUNT") || "N/A"),
+    "Last incremental since: " +
+      (scriptProps.getProperty("SOURCE_SCAN_LAST_SINCE") || "N/A"),
     "",
     "Source folder stats",
     "Excel files total: " + totalExcel,
-    "Excel files with " +
+    "Excel files mapped to " +
       getConfiguredYears_().join("/") +
-      " in name: " +
+      " (name/date fallback): " +
       withYear,
-    "Excel files skipped (missing year in file name): " + noYear,
+    "Excel files skipped (cannot map to configured years): " + noYear,
     "Already done: " + alreadyDone,
     "Blocked by failed-attempt limit: " + blockedByFailedAttempts,
     "Pending for next runs: " + pending,
@@ -4019,9 +4486,9 @@ function debugAutoProcessingStatus() {
   if (sampleNoYear.length) {
     msg.push("");
     msg.push(
-      "Sample skipped files (missing " +
+      "Sample skipped files (cannot map to " +
         getConfiguredYears_().join("/") +
-        " in filename):",
+        " via name/date):",
     );
     sampleNoYear.forEach(function (n) {
       msg.push("- " + n);
