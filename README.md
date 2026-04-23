@@ -1,6 +1,6 @@
 # GR Template Automation Consolidator
 
-**Version:** 1.0 | **Last Updated:** April 20, 2026
+**Version:** 1.0 | **Last Updated:** April 23, 2026
 
 A Google Apps Script automation system for consolidating Goods Receipt (GR) data from multiple Excel files into unified, Google Sheets.
 
