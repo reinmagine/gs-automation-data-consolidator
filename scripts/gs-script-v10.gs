@@ -1020,9 +1020,59 @@ function findFolder_(name) {
 }
 
 function getOrCreateTempFolder_() {
-  const iter = DriveApp.getFoldersByName(CONFIG.tempFolderName);
-  if (iter.hasNext()) return iter.next();
-  return DriveApp.createFolder(CONFIG.tempFolderName);
+  const name = CONFIG.tempFolderName;
+  const iter = DriveApp.getFoldersByName(name);
+  var folder = null;
+  if (iter.hasNext()) {
+    folder = iter.next();
+    try {
+      // Remove broad/link permissions via Advanced Drive API if available
+      if (typeof Drive !== "undefined" && Drive && Drive.Permissions) {
+        var permsResp = Drive.Permissions.list(folder.getId());
+        var items = (permsResp && permsResp.items) || (permsResp && permsResp.permissions) || [];
+        var removed = 0;
+        for (var pi = 0; pi < items.length; pi++) {
+          var p = items[pi];
+          if (!p || !p.type) continue;
+          if (p.type === "anyone" || p.type === "anyoneWithLink" || (p.type === "domain" && p.role === "reader")) {
+            try {
+              Drive.Permissions.remove(folder.getId(), p.id);
+              removed++;
+            } catch (ePermRemove) {}
+          }
+        }
+        if (removed > 0) {
+          Logger.log("Temp folder permissions cleaned: removed " + removed);
+        }
+      }
+    } catch (ePermList) {}
+
+    // Also attempt DriveApp-level cleanup to remove explicit viewers/editors
+    try {
+      var fviewers = folder.getViewers();
+      for (var vi = 0; vi < fviewers.length; vi++) {
+        try {
+          folder.removeViewer(fviewers[vi]);
+        } catch (eRemoveV) {}
+      }
+      var feditors = folder.getEditors();
+      for (var ei = 0; ei < feditors.length; ei++) {
+        try {
+          folder.removeEditor(feditors[ei]);
+        } catch (eRemoveE) {}
+      }
+      try {
+        folder.setSharing(DriveApp.Access.PRIVATE, DriveApp.Permission.VIEW);
+      } catch (eSet) {}
+    } catch (eDriveApp) {}
+    return folder;
+  }
+
+  folder = DriveApp.createFolder(name);
+  try {
+    folder.setSharing(DriveApp.Access.PRIVATE, DriveApp.Permission.VIEW);
+  } catch (e) {}
+  return folder;
 }
 
 function isTempArtifactName_(name) {
@@ -1593,6 +1643,10 @@ function convertExcelToTempSheet_(fileInfo, tempFolder) {
       createdFile.moveTo(tempFolder);
     } catch (eMove) {}
 
+    try {
+      ensureFileRestricted_(copied.id);
+    } catch (eEnsure) {}
+
     return copied.id;
   } catch (e) {
     const errMsg = ((e && e.message) || "").toLowerCase();
@@ -1613,6 +1667,10 @@ function convertExcelToTempSheet_(fileInfo, tempFolder) {
         createdFallback.moveTo(tempFolder);
       } catch (eMove2) {}
 
+      try {
+        ensureFileRestricted_(copiedFallback.id);
+      } catch (eEnsure2) {}
+
       return copiedFallback.id;
     } catch (e2) {
       const errMsg2 = ((e2 && e2.message) || "").toLowerCase();
@@ -1625,6 +1683,62 @@ function convertExcelToTempSheet_(fileInfo, tempFolder) {
       throw e2;
     }
   }
+}
+
+function ensureFileRestricted_(fileId) {
+  if (!fileId) return;
+
+  // Remove broad/link permissions via Advanced Drive API when available
+  try {
+    if (typeof Drive !== "undefined" && Drive && Drive.Permissions) {
+      var permsResp = Drive.Permissions.list(fileId);
+      var items =
+        (permsResp && permsResp.items) || (permsResp && permsResp.permissions) || [];
+      var removed = 0;
+      for (var i = 0; i < items.length; i++) {
+        var p = items[i];
+        if (!p || !p.type) continue;
+        if (
+          p.type === "anyone" ||
+          p.type === "anyoneWithLink" ||
+          (p.type === "domain" && p.role === "reader")
+        ) {
+          try {
+            Drive.Permissions.remove(fileId, p.id);
+            removed++;
+          } catch (ePermRemove) {}
+        }
+      }
+      if (removed > 0) {
+        Logger.log("Temp file permissions cleaned: removed " + removed);
+      }
+    }
+  } catch (ePermList) {}
+
+  // Fallback: remove viewers/editors and force private
+  try {
+    var f = DriveApp.getFileById(fileId);
+    var viewers = [];
+    var editors = [];
+    try {
+      viewers = f.getViewers();
+      editors = f.getEditors();
+    } catch (eLists) {}
+
+    for (var vi = 0; vi < viewers.length; vi++) {
+      try {
+        f.removeViewer(viewers[vi]);
+      } catch (eRemoveV) {}
+    }
+    for (var ei = 0; ei < editors.length; ei++) {
+      try {
+        f.removeEditor(editors[ei]);
+      } catch (eRemoveE) {}
+    }
+    try {
+      f.setSharing(DriveApp.Access.PRIVATE, DriveApp.Permission.VIEW);
+    } catch (eSet) {}
+  } catch (eFallback) {}
 }
 
 function openSpreadsheetWithRetry_(fileId, attempts, delayMs) {
@@ -4601,3 +4715,4 @@ function findOutputSheetByYear_(ss, year) {
     return null;
   }
 }
+
