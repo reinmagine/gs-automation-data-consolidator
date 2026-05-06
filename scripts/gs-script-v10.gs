@@ -39,6 +39,8 @@ const CONFIG = {
   maxFailedAttemptsPerFile: 5,
   onlyIncludeVisibleRows: true,
   doneStatusText: "Done",
+  backfillMissingSourceFilesWhenFixing: true,
+  backfillPickTopMatchOnTie: false,
 };
 
 // Output columns
@@ -2985,12 +2987,20 @@ function fixSourceFileHyperlinksNow() {
     }
   });
 
-  notify_(
+  let backfillMsg = "";
+  if (CONFIG.backfillMissingSourceFilesWhenFixing) {
+    backfillMsg = backfillMissingSourceLinks_(false, {
+      suppressNotify: true,
+    });
+  }
+
+  let msg =
     "Source File hyperlink conversion complete.\nTotal converted: " +
-      totalFixed +
-      "\n\n" +
-      details.join("\n"),
-  );
+    totalFixed +
+    "\n\n" +
+    details.join("\n");
+  if (backfillMsg) msg += "\n\n" + backfillMsg;
+  notify_(msg);
 }
 
 // Logging and maintenance
@@ -3235,7 +3245,8 @@ function buildFileUrlMapByName_(folder) {
 }
 
 // Backfill Source links
-function backfillMissingSourceLinks_(dryRun) {
+function backfillMissingSourceLinks_(dryRun, options) {
+  options = options || {};
   const ss = getSpreadsheet_();
   if (!ss) return "Bound spreadsheet not found.";
 
@@ -3290,19 +3301,37 @@ function backfillMissingSourceLinks_(dryRun) {
     const rowCount = lastRow - 1;
     const maxCol = Math.max(sh.getLastColumn(), sourceCol);
     const data = sh.getRange(2, 1, rowCount, maxCol).getDisplayValues();
+    const sourceFormulas = sh
+      .getRange(2, sourceCol, rowCount, 1)
+      .getFormulas();
 
-    const outSources = [];
+    const pendingWrites = [];
     let scanned = 0,
       updated = 0,
       ambiguous = 0,
       nomatch = 0;
 
+    let runStart = null;
+    let runFormulas = [];
+
+    function flushRun() {
+      if (runStart === null) return;
+      pendingWrites.push({ startRow: runStart, formulas: runFormulas });
+      runStart = null;
+      runFormulas = [];
+    }
+
     for (let i = 0; i < data.length; i++) {
       const row = data[i];
-      const existing = String(row[sourceCol - 1] || "").trim();
+      const existingDisplay = String(row[sourceCol - 1] || "").trim();
+      const existingFormula = String(sourceFormulas[i][0] || "").trim();
       scanned++;
-      if (existing) {
-        outSources.push([existing]);
+      if (existingFormula && existingFormula.indexOf("=") === 0) {
+        flushRun();
+        continue;
+      }
+      if (existingDisplay) {
+        flushRun();
         continue;
       }
 
@@ -3322,7 +3351,7 @@ function backfillMissingSourceLinks_(dryRun) {
         });
 
       if (tokensClean.length === 0) {
-        outSources.push([""]);
+        flushRun();
         nomatch++;
         continue;
       }
@@ -3339,51 +3368,74 @@ function backfillMissingSourceLinks_(dryRun) {
           candidates.push({ file: filesArr[fI], matchCount: matchCount });
       }
 
+      let formulaToWrite = "";
       if (candidates.length === 1) {
         const f = candidates[0].file;
-        const formula =
+        formulaToWrite =
           '=HYPERLINK("' +
           f.url.replace(/"/g, '""') +
           '","' +
           f.name.replace(/"/g, '""') +
           '")';
-        outSources.push([formula]);
         updated++;
       } else if (candidates.length > 1) {
         // Sort by match count desc
         candidates.sort(function (a, b) {
           return b.matchCount - a.matchCount;
         });
-        if (
-          candidates[0].matchCount >
-          (candidates[1] ? candidates[1].matchCount : 0)
-        ) {
-          const f = candidates[0].file;
-          const formula =
+        const top = candidates[0];
+        const second = candidates[1];
+        const pickTopOnTie = CONFIG.backfillPickTopMatchOnTie !== false;
+        const topWins =
+          top.matchCount > (second ? second.matchCount : 0);
+
+        if (topWins || pickTopOnTie) {
+          const f = top.file;
+          formulaToWrite =
             '=HYPERLINK("' +
             f.url.replace(/"/g, '""') +
             '","' +
             f.name.replace(/"/g, '""') +
             '")';
-          outSources.push([formula]);
           updated++;
         } else {
-          outSources.push([""]);
           ambiguous++;
         }
       } else {
-        outSources.push([""]);
         nomatch++;
+      }
+
+      if (formulaToWrite) {
+        if (runStart === null) {
+          runStart = i;
+          runFormulas = [[formulaToWrite]];
+        } else if (i === runStart + runFormulas.length) {
+          runFormulas.push([formulaToWrite]);
+        } else {
+          flushRun();
+          runStart = i;
+          runFormulas = [[formulaToWrite]];
+        }
+      } else {
+        flushRun();
       }
     }
 
-    if (!dryRun) {
-      try {
-        sh.getRange(2, sourceCol, outSources.length, 1).setValues(outSources);
-      } catch (e) {
-        notes.push(
-          year + ": error writing Source File column (" + e.message + ")",
-        );
+    flushRun();
+
+    if (!dryRun && pendingWrites.length > 0) {
+      for (let w = 0; w < pendingWrites.length; w++) {
+        const write = pendingWrites[w];
+        try {
+          sh
+            .getRange(2 + write.startRow, sourceCol, write.formulas.length, 1)
+            .setFormulas(write.formulas);
+        } catch (e) {
+          notes.push(
+            year + ": error writing Source File column (" + e.message + ")",
+          );
+          break;
+        }
       }
     }
 
@@ -3417,7 +3469,7 @@ function backfillMissingSourceLinks_(dryRun) {
     "\n\n" +
     notes.join("\n");
 
-  if (!dryRun) notify_(msg);
+  if (!dryRun && !options.suppressNotify) notify_(msg);
   return msg;
 }
 
@@ -3427,6 +3479,156 @@ function backfillMissingSourceLinksPreview() {
 
 function backfillMissingSourceLinksNow() {
   return backfillMissingSourceLinks_(false);
+}
+
+function exportBackfillAmbiguousExamplesNow() {
+  const ss = getSpreadsheet_();
+  if (!ss) {
+    notify_("No spreadsheet found.");
+    return;
+  }
+
+  const sourceFolder = findFolder_(CONFIG.sourceFolderName);
+  if (!sourceFolder) {
+    notify_("Source folder not found: " + CONFIG.sourceFolderName);
+    return;
+  }
+
+  const filesArr = [];
+  const files = sourceFolder.getFiles();
+  while (files.hasNext()) {
+    const f = files.next();
+    filesArr.push({
+      name: String(f.getName() || ""),
+      nameLower: String(f.getName() || "").toLowerCase(),
+      url: f.getUrl(),
+      id: f.getId(),
+    });
+  }
+
+  const years = getConfiguredYears_();
+  const diagSheetName = "Backfill Diagnostics";
+  var diagSh = ss.getSheetByName(diagSheetName);
+  if (diagSh) {
+    diagSh.clear();
+  } else {
+    diagSh = ss.insertSheet(diagSheetName);
+  }
+
+  const header = [
+    "Year",
+    "Sheet",
+    "Row",
+    "PO No.",
+    "GR Mat. Doc.",
+    "WBS Element",
+    "PO PLA ID",
+    "Installed PLA ID",
+    "Tokens",
+    "CandidateCount",
+    "TopCandidates",
+  ];
+
+  const outRows = [header];
+
+  years.forEach(function (year) {
+    const sh = findOutputSheetByYear_(ss, year);
+    if (!sh) return;
+
+    const lastRow = sh.getLastRow();
+    if (lastRow < 2) return;
+
+    const sourceCol = getColumnIndexByHeader_(sh, CONFIG.sourceHeaderName);
+    if (sourceCol < 1) return;
+
+    const poCol = getColumnIndexByHeader_(sh, "PO No.");
+    const grCol = getColumnIndexByHeader_(sh, "GR Mat. Doc.");
+    const wbsCol = getColumnIndexByHeader_(sh, "WBS Element");
+    const poPlaCol = getColumnIndexByHeader_(sh, "PO PLA ID");
+    const instPlaCol = getColumnIndexByHeader_(sh, "Installed PLA ID");
+
+    const rowCount = lastRow - 1;
+    const maxCol = Math.max(sh.getLastColumn(), sourceCol);
+    const data = sh.getRange(2, 1, rowCount, maxCol).getDisplayValues();
+    const sourceFormulas = sh.getRange(2, sourceCol, rowCount, 1).getFormulas();
+
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i];
+      const existingDisplay = String(row[sourceCol - 1] || "").trim();
+      const existingFormula = String(sourceFormulas[i][0] || "").trim();
+      if (existingFormula && existingFormula.indexOf("=") === 0) continue;
+      if (existingDisplay) continue;
+
+      const tokens = [];
+      if (poCol > 0) tokens.push(String(row[poCol - 1] || "").trim());
+      if (grCol > 0) tokens.push(String(row[grCol - 1] || "").trim());
+      if (wbsCol > 0) tokens.push(String(row[wbsCol - 1] || "").trim());
+      if (poPlaCol > 0) tokens.push(String(row[poPlaCol - 1] || "").trim());
+      if (instPlaCol > 0) tokens.push(String(row[instPlaCol - 1] || "").trim());
+
+      const tokensClean = tokens
+        .filter(function (t) {
+          return t && String(t).trim() !== "";
+        })
+        .map(function (t) {
+          return String(t).toLowerCase();
+        });
+
+      if (tokensClean.length === 0) continue;
+
+      const candidates = [];
+      for (let fI = 0; fI < filesArr.length; fI++) {
+        const fn = filesArr[fI].nameLower;
+        let matchCount = 0;
+        for (let ti = 0; ti < tokensClean.length; ti++) {
+          if (tokensClean[ti] && fn.indexOf(tokensClean[ti]) !== -1) matchCount++;
+        }
+        if (matchCount > 0) candidates.push({ file: filesArr[fI], matchCount: matchCount });
+      }
+
+      if (candidates.length > 1) {
+        candidates.sort(function (a, b) {
+          return b.matchCount - a.matchCount;
+        });
+        const top = candidates[0];
+        const second = candidates[1];
+        const pickTopOnTie = CONFIG.backfillPickTopMatchOnTie !== false;
+        const topWins = top.matchCount > (second ? second.matchCount : 0);
+        if (!topWins && !pickTopOnTie) {
+          const topList = candidates
+            .slice(0, 5)
+            .map(function (c) {
+              return c.matchCount + ":" + c.file.name + " (" + c.file.id + ")";
+            })
+            .join(" | ");
+
+          outRows.push([
+            year,
+            sh.getName(),
+            2 + i,
+            poCol > 0 ? row[poCol - 1] : "",
+            grCol > 0 ? row[grCol - 1] : "",
+            wbsCol > 0 ? row[wbsCol - 1] : "",
+            poPlaCol > 0 ? row[poPlaCol - 1] : "",
+            instPlaCol > 0 ? row[instPlaCol - 1] : "",
+            tokensClean.join(" | "),
+            candidates.length,
+            topList,
+          ]);
+        }
+      }
+    }
+  });
+
+  if (outRows.length <= 1) {
+    notify_("No ambiguous backfill rows found.");
+    diagSh.clear();
+    diagSh.getRange(1, 1, 1, header.length).setValues([header]);
+    return;
+  }
+
+  diagSh.getRange(1, 1, outRows.length, outRows[0].length).setValues(outRows);
+  notify_("Backfill diagnostics written to sheet: " + diagSheetName + " (rows: " + (outRows.length - 1) + ")");
 }
 
 function backfillTrackerMonthsNow() {
