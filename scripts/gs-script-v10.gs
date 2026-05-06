@@ -36,7 +36,7 @@ const CONFIG = {
   openRetryAttempts: 3,
   openRetryDelayMs: 500,
   minHeaderMatches: 3,
-  maxFailedAttemptsPerFile: 5,
+  maxFailedAttemptsPerFile: 1,
   onlyIncludeVisibleRows: true,
   doneStatusText: "Done",
   backfillMissingSourceFilesWhenFixing: true,
