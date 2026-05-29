@@ -1563,19 +1563,19 @@ This section covers the most common problems and how to fix them.
 2. If missing, create it:
    - Right-click existing sheet → **Insert 1 sheet**
    - Name it "PLA Lookup"
-   - Add headers: PLA ID, Regional Area, SITE NAME, Territory
+  - Add headers: PLA ID, SITE NAME, FORMATTED ADDRESS, REGION, TERRITORY
    - Add sample lookup data
 
 **Step 2: Populate PLA Lookup**
 1. Click the **PLA Lookup** sheet
-2. Verify it has at least these columns: PLA ID, Regional Area, SITE NAME, Territory
-3. Add rows with your PLA ID to Region/Site/Territory mappings
+2. Verify it has at least these columns: PLA ID, SITE NAME, FORMATTED ADDRESS, REGION, TERRITORY
+3. Add rows with your PLA ID to Region/Site/Territory mappings; `FORMATTED ADDRESS` is optional for the script
 
 **Example PLA Lookup:**
-| PLA ID | Regional Area | SITE NAME | Territory |
-|--------|---------------|-----------|-----------|
-| PH001 | APAC | Manila | Philippines |
-| SG002 | APAC | Singapore | Singapore |
+| PLA ID | SITE NAME | FORMATTED ADDRESS | REGION | TERRITORY |
+|--------|-----------|-------------------|--------|-----------|
+| PH001 | Manila | Makati, Metro Manila | APAC | Philippines |
+| SG002 | Singapore | Singapore | APAC | Singapore |
 | SG003 | APAC | Singapore | Singapore |
 
 **Step 3: Trigger enrichment backfill**
