@@ -1,6 +1,6 @@
 # GR Template Automation Consolidator
 
-**Version:** 1.0.1 | **Last Updated:** May 5, 2026
+**Version:** 1.0.1 | **Last Updated:** May 29, 2026
 
 A Google Apps Script automation system for consolidating Goods Receipt (GR) data from multiple Excel files into unified, Google Sheets.
 
@@ -30,7 +30,7 @@ This project automates the processing of GR (Goods Receipt) templates from a Dri
 2. **Paste the script:**
    - Click **Extensions** → **Apps Script**
    - Delete any existing code
-   - Copy-paste the full content of `scripts/gs-script-v10.gs`
+   - Copy-paste the full content of `scripts/gs-script-v11.gs`
    - Click **Save**
 
 3. **Enable Drive API:**
@@ -115,9 +115,9 @@ Structured function reference with columns:
 gs-automation-consolidator/
 ├── README.md                           ← You are here
 ├── scripts/
-│   ├── gs-script-v10.gs               ← Main Apps Script (3000+ lines)
-│   ├── gs-script-v9.gs                ← Previous version
-│   └── gs-script-v1.gs ... v8.gs      ← Version history
+│   ├── gs-script-v11.gs               ← Main Apps Script (3000+ lines)
+│   ├── gs-script-v10.gs               ← Previous version
+│   └── gs-script-v1.gs ... v9.gs      ← Version history
 ├── docs/
 │   ├── USER_MANUAL_GR_CONSOLIDATION.md    ← User guide (80+ pages)
 │   ├── ANNOTATED_CODE_GUIDE.md            ← Developer guide (50+ pages)
@@ -181,7 +181,7 @@ CONTROL:
 
 ## Configuration
 
-All settings are in the `CONFIG` object at the top of `gs-script-v10.gs`:
+All settings are in the `CONFIG` object at the top of `gs-script-v11.gs`:
 
 ### Key Settings
 
