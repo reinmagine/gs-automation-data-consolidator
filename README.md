@@ -235,7 +235,8 @@ Tracks every file processed:
 
 ### 3. PLA Lookup (enrichment data)
 Contains location/territory mappings:
-- PLA ID, Regional Area, Site Name, Territory
+- PLA ID, SITE NAME, FORMATTED ADDRESS, REGION, TERRITORY
+- `FORMATTED ADDRESS` is stored for reference but ignored by the script
 - Used to enrich output rows automatically
 
 ### 4. GR Automation Config (optional)
@@ -250,6 +251,30 @@ Performance metrics for each processed file:
 - File Name, Year, Conversion Time, Open Time, Parse Time, Append Time, Total Time
 - Rows Added, Status
 - Useful for identifying slow files and bottlenecks
+
+## GR Automation menu (Screenshots)
+
+Below are screenshots of the `GR Automation` menu as it appears in Google Sheets, shown by menu group.
+
+![Processing menu](docs/img/1-processing.png)
+
+**Processing:** Process All New Files Now, Process Files for Year..., Retry Failed Files
+
+![GR Posted Sheets menu](docs/img/2-gr-posted-sheets.png)
+
+**GR Posted Sheets:** Backfill Lookup & Territory, Recompute USD for All Rows, Fix Source File Hyperlinks
+
+![Tracker & Logs menu](docs/img/3-tracker-logs.png)
+
+**Tracker & Logs:** Fix Tracker File Links, Backfill Missing Months, Backfill Source Links
+
+![Automation menu](docs/img/4-automation.png)
+
+**Automation:** Start Auto Trigger (1 min), Stop Auto Trigger, Show Auto Processing Status
+
+![Admin menu](docs/img/5-admin.png)
+
+**Admin:** Check Lookup & Output Setup, Clean Temp Files, Cleanup Duplicates, Test One Source File (Debug)
 
 ## Menu Actions
 
