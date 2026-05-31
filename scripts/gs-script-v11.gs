@@ -167,7 +167,9 @@ function getEnrichmentForRow_(row, lookupMap) {
     }
   }
 
-  var usd = toUsdIfPhp_(row[COL["Amount To Billed"]], row[COL["Currency"]]);
+  var amountForUsd = chooseAmountForUsd_(row);
+  var currencyForUsd = inferCurrencyFromRow_(row);
+  var usd = toUsdIfPhp_(amountForUsd, currencyForUsd);
   return [regional, cleaned, territory, usd];
 }
 
@@ -628,34 +630,49 @@ function isManagedServices_(materialDesc, serviceShortText) {
   );
 }
 
-function isPhpCurrency_(currencyValue) {
+function normalizeCurrencyCode_(currencyValue) {
   var c = String(currencyValue || "")
+    .replace(/\u00a0/g, " ")
     .toLowerCase()
     .trim();
-  return (
-    c === "php" ||
-    c === "peso" ||
-    c === "pesos" ||
-    c === "₱" ||
-    c === "philippine peso" ||
-    c === "philippine pesos"
-  );
+  if (!c) return "";
+
+  if (
+    c.indexOf("php") !== -1 ||
+    c.indexOf("peso") !== -1 ||
+    c.indexOf("philippine peso") !== -1 ||
+    c.indexOf("ph peso") !== -1 ||
+    c.indexOf("₱") !== -1
+  ) {
+    return "PHP";
+  }
+
+  if (
+    c.indexOf("usd") !== -1 ||
+    c.indexOf("us dollar") !== -1 ||
+    c.indexOf("us dollars") !== -1 ||
+    c.indexOf("$") !== -1
+  ) {
+    return "USD";
+  }
+
+  if (c.indexOf("eur") !== -1 || c.indexOf("euro") !== -1 || c.indexOf("€") !== -1) {
+    return "EUR";
+  }
+
+  return "";
 }
 
-
+function isPhpCurrency_(currencyValue) {
+  return normalizeCurrencyCode_(currencyValue) === "PHP";
+}
 
 function isUsdCurrency_(currencyValue) {
-  var c = String(currencyValue || "")
-    .toLowerCase()
-    .trim();
-  return c === "usd" || c === "us dollar" || c === "us dollars" || c === "$";
+  return normalizeCurrencyCode_(currencyValue) === "USD";
 }
 
 function isEurCurrency_(currencyValue) {
-  var c = String(currencyValue || "")
-    .toLowerCase()
-    .trim();
-  return c === "eur" || c === "euro" || c === "euros" || c === "€";
+  return normalizeCurrencyCode_(currencyValue) === "EUR";
 }
 
 function parseAmount_(v) {
@@ -697,6 +714,7 @@ function parseAmount_(v) {
     .replace(/philippine\s*pesos?/gi, "");
 
   s = s.replace(/[^0-9.-]/g, "");
+  if (!/[0-9]/.test(s)) return NaN;
 
   var n = Number(s);
   if (isNaN(n)) return NaN;
@@ -707,33 +725,54 @@ function toUsdIfPhp_(amountValue, currencyValue) {
   var amount = parseAmount_(amountValue);
   if (isNaN(amount)) return "";
 
-  var cur = String(currencyValue || "")
-    .toLowerCase()
-    .trim();
-  var amtText = String(amountValue || "").toLowerCase();
+  var cur = normalizeCurrencyCode_(currencyValue) || normalizeCurrencyCode_(amountValue);
 
-  if (
-    isUsdCurrency_(cur) ||
-    amtText.indexOf("$") !== -1 ||
-    amtText.indexOf("usd") !== -1
-  ) {
+  if (cur === "USD") {
     return amount;
   }
 
-  if (
-    isPhpCurrency_(cur) ||
-    isEurCurrency_(cur) ||
-    amtText.indexOf("₱") !== -1 ||
-    amtText.indexOf("php") !== -1 ||
-    amtText.indexOf("peso") !== -1 ||
-    amtText.indexOf("€") !== -1 ||
-    amtText.indexOf("eur") !== -1 ||
-    amtText.indexOf("euro") !== -1
-  ) {
+  if (cur === "PHP" || cur === "EUR") {
     return amount / CONFIG.usdConversionRate;
   }
 
   return "";
+}
+
+function inferCurrencyFromRow_(row, rowFormats, columnMap) {
+  if (!row) return "";
+
+  var headers = ["Currency", "Amount To Billed", "Sub Total", "PO Unit Price"];
+  for (var i = 0; i < headers.length; i++) {
+    var header = headers[i];
+    var idx = COL[header];
+    var value = row[idx];
+    var code = normalizeCurrencyCode_(value);
+    if (code) return code;
+
+    if (rowFormats && columnMap) {
+      var srcIdx = columnMap[header];
+      if (srcIdx !== undefined) {
+        code = normalizeCurrencyCode_(rowFormats[srcIdx]);
+        if (code) return code;
+      }
+    }
+  }
+
+  return "";
+}
+
+function chooseAmountForUsd_(row) {
+  if (!row) return "";
+
+  var amount = row[COL["Amount To Billed"]];
+  var amountNum = parseAmount_(amount);
+  if (!isNaN(amountNum) && String(amount || "").trim() !== "") return amount;
+
+  var sub = row[COL["Sub Total"]];
+  var subNum = parseAmount_(sub);
+  if (!isNaN(subNum)) return sub;
+
+  return amount || sub || "";
 }
 
 function loadPlaLookupMap_(ss) {
@@ -986,63 +1025,8 @@ function addConfiguredYear(year, sheetName, spreadsheetId, createSheet) {
 }
 
 function fillCurrencyFromHints_(outRow, rowFormats, columnMap) {
-  var cur = String(outRow[21] || "").trim();
-  if (cur) return;
-
-  var textHint = [outRow[18], outRow[19], outRow[20]]
-    .map(function (v) {
-      return String(v || "").toLowerCase();
-    })
-    .join(" ");
-
-  if (textHint.indexOf("$") !== -1 || textHint.indexOf("usd") !== -1) {
-    outRow[21] = "USD";
-    return;
-  }
-  if (
-    textHint.indexOf("€") !== -1 ||
-    textHint.indexOf("eur") !== -1 ||
-    textHint.indexOf("euro") !== -1
-  ) {
-    outRow[21] = "EUR";
-    return;
-  }
-  if (
-    textHint.indexOf("₱") !== -1 ||
-    textHint.indexOf("php") !== -1 ||
-    textHint.indexOf("peso") !== -1
-  ) {
-    outRow[21] = "PHP";
-    return;
-  }
-
-  function fmtFor(header) {
-    var idx = columnMap[header];
-    if (idx === undefined || !rowFormats || !rowFormats.length) return "";
-    return String(rowFormats[idx] || "").toLowerCase();
-  }
-
-  var fmtHint = [
-    fmtFor("PO Unit Price"),
-    fmtFor("Sub Total"),
-    fmtFor("Amount To Billed"),
-  ].join(" ");
-
-  if (fmtHint.indexOf("$") !== -1 || fmtHint.indexOf("usd") !== -1) {
-    outRow[21] = "USD";
-  } else if (
-    fmtHint.indexOf("€") !== -1 ||
-    fmtHint.indexOf("eur") !== -1 ||
-    fmtHint.indexOf("euro") !== -1
-  ) {
-    outRow[21] = "EUR";
-  } else if (
-    fmtHint.indexOf("₱") !== -1 ||
-    fmtHint.indexOf("php") !== -1 ||
-    fmtHint.indexOf("peso") !== -1
-  ) {
-    outRow[21] = "PHP";
-  }
+  var cur = inferCurrencyFromRow_(outRow, rowFormats, columnMap);
+  if (cur) outRow[21] = cur;
 }
 
 // Find and list files
@@ -2744,6 +2728,8 @@ function repairMainSiteColumnsNow() {
     const plaCol = getColumnIndexByHeader_(sh, "Installed PLA ID");
     const matCol = getColumnIndexByHeader_(sh, "Material Description");
     const svcCol = getColumnIndexByHeader_(sh, "PO Service Short Text");
+    const poUnitCol = getColumnIndexByHeader_(sh, "PO Unit Price");
+    const subCol = getColumnIndexByHeader_(sh, "Sub Total");
     const amtCol = getColumnIndexByHeader_(sh, "Amount To Billed");
     const curCol = getColumnIndexByHeader_(sh, "Currency");
     if (amtCol < 1 || curCol < 1) {
@@ -2768,6 +2754,12 @@ function repairMainSiteColumnsNow() {
       matCol > 0 ? sh.getRange(2, matCol, rowCount, 1).getDisplayValues() : [];
     const svcVals =
       svcCol > 0 ? sh.getRange(2, svcCol, rowCount, 1).getDisplayValues() : [];
+    const poUnitVals =
+      poUnitCol > 0
+        ? sh.getRange(2, poUnitCol, rowCount, 1).getDisplayValues()
+        : [];
+    const subVals =
+      subCol > 0 ? sh.getRange(2, subCol, rowCount, 1).getDisplayValues() : [];
     const amtVals = sh.getRange(2, amtCol, rowCount, 1).getDisplayValues();
     const curVals = sh.getRange(2, curCol, rowCount, 1).getDisplayValues();
 
@@ -2776,6 +2768,8 @@ function repairMainSiteColumnsNow() {
     const out = [];
     for (var i = 0; i < rowCount; i++) {
       var r = [];
+      r[COL["PO Unit Price"]] = poUnitVals.length ? poUnitVals[i][0] : "";
+      r[COL["Sub Total"]] = subVals.length ? subVals[i][0] : "";
       r[COL["Installed PLA ID"]] = plaVals[i] ? plaVals[i][0] : "";
       r[COL["WBS Element"]] = wbsVals.length ? wbsVals[i][0] : "";
       r[COL["Material Description"]] = matVals[i] ? matVals[i][0] : "";
@@ -2865,6 +2859,7 @@ function convertAmountToUsdForAllData() {
     const amtCol = getColumnIndexByHeader_(sh, "Amount To Billed");
     const curCol = getColumnIndexByHeader_(sh, "Currency");
     const subCol = getColumnIndexByHeader_(sh, "Sub Total");
+    const poUnitCol = getColumnIndexByHeader_(sh, "PO Unit Price");
     if (amtCol < 1 || curCol < 1) {
       notes.push(year + ": Amount To Billed/Currency header not found");
       return;
@@ -2881,17 +2876,31 @@ function convertAmountToUsdForAllData() {
     const subVals =
       subCol > 0 ? sh.getRange(2, subCol, rowCount, 1).getDisplayValues() : [];
     const curVals = sh.getRange(2, curCol, rowCount, 1).getDisplayValues();
+    const poVals =
+      poUnitCol > 0
+        ? sh.getRange(2, poUnitCol, rowCount, 1).getDisplayValues()
+        : [];
     const colInfo = ensureEnrichmentColumns_(sh);
 
     const usdOut = [];
     const amtOut = [];
+    const curOut = [];
     let repairedAmountCount = 0;
+    let repairedCurrencyCount = 0;
     for (var i = 0; i < rowCount; i++) {
+      var r = [];
       var amtRaw = amtVals[i][0];
       var subRaw = subVals.length ? subVals[i][0] : "";
+      var poRaw = poVals.length ? poVals[i][0] : "";
+      var curRaw = curVals[i][0];
+      r[COL["PO Unit Price"]] = poRaw;
+      r[COL["Sub Total"]] = subRaw;
+      r[COL["Amount To Billed"]] = amtRaw;
+      r[COL["Currency"]] = curRaw;
       var amtParsed = parseAmount_(amtRaw);
       var subParsed = parseAmount_(subRaw);
       var amtForUsd = amtRaw;
+      var inferredCurrency = inferCurrencyFromRow_(r);
 
       if (isNaN(amtParsed) && !isNaN(subParsed)) {
         amtForUsd = subRaw;
@@ -2899,11 +2908,17 @@ function convertAmountToUsdForAllData() {
       }
 
       amtOut.push([amtForUsd]);
-      usdOut.push([toUsdIfPhp_(amtForUsd, curVals[i][0])]);
+      curOut.push([inferredCurrency || normalizeCurrencyCode_(curRaw) || curRaw || ""]);
+      if (curOut[i][0] !== String(curRaw || "")) repairedCurrencyCount++;
+      usdOut.push([toUsdIfPhp_(amtForUsd, curOut[i][0])]);
     }
 
     if (repairedAmountCount > 0) {
       sh.getRange(2, amtCol, rowCount, 1).setValues(amtOut);
+    }
+
+    if (repairedCurrencyCount > 0) {
+      sh.getRange(2, curCol, rowCount, 1).setValues(curOut);
     }
 
     const usdRange = sh.getRange(2, colInfo.usdCol, rowCount, 1);
