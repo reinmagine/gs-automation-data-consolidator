@@ -209,6 +209,41 @@ function listSourceFilesFull_(sourceFolder) {
   return out;
 }
 
+function hasSourceChanged_(sourceFolder, sinceDate) {
+  if (!sourceFolder) return true;
+  try {
+    if (typeof Drive !== "undefined" && Drive && Drive.Files) {
+      const folderId = sourceFolder.getId();
+      if (!(sinceDate instanceof Date) || isNaN(sinceDate.getTime())) return true;
+      const qParts = ["'" + folderId + "' in parents", "trashed = false"];
+      qParts.push("modifiedTime >= '" + sinceDate.toISOString() + "'");
+      const query = qParts.join(" and ");
+      const resp = Drive.Files.list({
+        q: query,
+        maxResults: 1,
+        pageSize: 1,
+        orderBy: "modifiedTime desc",
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+        fields: "items(id,title,modifiedDate,modifiedTime),files(id,name,modifiedTime),nextPageToken",
+      });
+      const items = (resp && (resp.items || resp.files)) ? (resp.items || resp.files) : [];
+      return items.length > 0;
+    } else {
+      const files = sourceFolder.getFiles();
+      while (files.hasNext()) {
+        const f = files.next();
+        const last = getFileLastUpdatedSafe_(f);
+        if (last && sinceDate instanceof Date && last.getTime() >= sinceDate.getTime())
+          return true;
+      }
+      return false;
+    }
+  } catch (e) {
+    return true;
+  }
+}
+
 function listSourceFilesIncremental_(sourceFolder, sinceDate) {
   const out = [];
   if (!sourceFolder) return out;
@@ -238,6 +273,8 @@ function listSourceFilesIncremental_(sourceFolder, sinceDate) {
       orderBy: "modifiedTime desc",
       supportsAllDrives: true,
       includeItemsFromAllDrives: true,
+      fields:
+        "items(id,title,modifiedDate,modifiedTime,createdDate,alternateLink,webViewLink),files(id,name,modifiedTime),nextPageToken",
     });
     const items = resp && resp.items ? resp.items : [];
     for (let i = 0; i < items.length; i++) {
@@ -295,7 +332,13 @@ function listSourceFilesForScan_(sourceFolder, scriptProps, options) {
     sinceDate = new Date(sinceDate.getTime() - overlapMinutes * 60 * 1000);
 
     try {
-      files = listSourceFilesIncremental_(sourceFolder, sinceDate);
+      const changed = hasSourceChanged_(sourceFolder, sinceDate);
+      if (!changed) {
+        mode = "incremental-skip";
+        files = [];
+      } else {
+        files = listSourceFilesIncremental_(sourceFolder, sinceDate);
+      }
     } catch (eInc) {
       Logger.log(
         "Incremental scan failed, fallback to full scan: " +
