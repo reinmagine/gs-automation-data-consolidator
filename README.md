@@ -4,6 +4,14 @@
 
 A Google Apps Script automation system for consolidating Goods Receipt (GR) data from multiple Excel files into unified, Google Sheets.
 
+## Recent changes
+
+- Refactored repository: legacy single-file scripts were moved into `backups/` and the active codebase was split into four modular files under the `main-scripts/` directory.
+- Added CLI deployment configuration for Google Apps Script using `clasp`. The project is configured to sync `main-scripts/` with the Apps Script project `scriptId: 1GO8CYqTAtwPMgVCxFn7lbeVr1nP3ZYSQU8XiVdPKHBcmwWENdvpWf6t4`.
+- Added `appsscript.json` (minimal manifest), `.clasp.json`, `.claspignore`, and `package.json` with `@google/clasp` dev tooling. These files allow pushing and pulling source to the Apps Script editor without manual copy/paste.
+
+This README retains the original project overview and documentation links below. See `docs/` for full user and developer guides.
+
 ## Overview
 
 This project automates the processing of GR (Goods Receipt) templates from a Drive folder, extracting data into consolidated sheets with automatic enrichment (PLA lookup, currency conversion, territory mapping).

@@ -1,0 +1,15 @@
+{
+  "name": "gs-automation-data-consolidator",
+  "version": "1.0.0",
+  "description": "Local repo for Google Apps Script project (clasp-enabled).",
+  "private": true,
+  "devDependencies": {
+    "@google/clasp": "^2.4.1"
+  },
+  "scripts": {
+    "clasp:login": "npx @google/clasp login",
+    "clasp:push": "npx @google/clasp push",
+    "clasp:pull": "npx @google/clasp pull",
+    "clasp:status": "npx @google/clasp status"
+  }
+}
