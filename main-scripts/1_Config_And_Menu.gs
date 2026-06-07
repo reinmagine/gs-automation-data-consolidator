@@ -1,6 +1,8 @@
 // GR Template Automation Consolidator v11
 
+// CONFIGURATIONS AND MENU
 // This file contains the global variables, caches, and the UI menu so they load first.
+
 // Configuration
 const CONFIG = {
   sourceFolderName: "GR template with Matdoc Reference: (File responses)",
@@ -27,7 +29,7 @@ const CONFIG = {
   incrementalScanOverlapMinutes: 15,
   incrementalScanPageSize: 250,
   incrementalScanMaxFilesToInspect: 2000,
-  forceFullScanEveryRuns: 30,
+  forceFullScanEveryRuns: 999,
   fullScanMaxFilesToInspect: 0,
   headerScanMaxRows: 80,
   maxRowsPerSheetScan: 2500,
@@ -261,7 +263,7 @@ function onOpen() {
 
   const automation = ui
     .createMenu("Automation")
-    .addItem("Start Auto Trigger (1 min)", "setupAutomaticEvery1Min")
+    .addItem("Start Auto Trigger (5 min)", "setupAutomaticEvery5Min")
     .addItem("Stop Auto Trigger", "stopAutomatic")
     .addItem("Show Auto Processing Status", "debugAutoProcessingStatus");
 

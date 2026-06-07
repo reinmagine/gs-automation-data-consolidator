@@ -1,4 +1,6 @@
+// TRACKER AND SHEETS
 // Everything related to reading/writing to the Google Sheets, lookup tables, formatting output, and logging.
+
 // Unified Tracker Reader
 function loadAllTrackerData_(ss) {
   const result = { processedMap: {}, doneKeyMap: {}, failedAttemptsMap: {} };

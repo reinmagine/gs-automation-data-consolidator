@@ -1,6 +1,8 @@
+// MAIN TRIGGERS
 // This file contains the core execution logic and time-based triggers.
+
 // Triggers
-function setupAutomaticEvery1Min() {
+function setupAutomaticEvery5Min() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) {
     SpreadsheetApp.getUi().alert(

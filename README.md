@@ -1,135 +1,141 @@
 # GR Template Automation Consolidator
 
-**Version:** 1.0.1 | **Last Updated:** May 29, 2026
+This repository is designed to manage GR Excel templates across Google Drive and consolidate them into a unified Google Sheets workflow. The code is structured for local development using `clasp`, while preserving the Apps Script behavior that executes inside Google Sheets.
 
-A Google Apps Script automation system for consolidating Goods Receipt (GR) data from multiple Excel files into unified, Google Sheets.
+---
 
-## Recent changes
+## What this project does
 
-- Refactored repository: legacy single-file scripts were moved into `backups/` and the active codebase was split into four modular files under the `main-scripts/` directory.
-- Added CLI deployment configuration for Google Apps Script using `clasp`. The project is configured to sync `main-scripts/` with the Apps Script project `scriptId: 1GO8CYqTAtwPMgVCxFn7lbeVr1nP3ZYSQU8XiVdPKHBcmwWENdvpWf6t4`.
-- Added `appsscript.json` (minimal manifest), `.clasp.json`, `.claspignore`, and `package.json` with `@google/clasp` dev tooling. These files allow pushing and pulling source to the Apps Script editor without manual copy/paste.
+The system is built to reliably perform three core tasks:
 
-This README retains the original project overview and documentation links below. See `docs/` for full user and developer guides.
+1. Detect new GR template files in a Drive folder.
+2. Convert and parse them without manual cleanup.
+3. Append clean, enriched rows into year-based reporting sheets.
 
-## Overview
+This is a working automation pipeline with tracker logging, duplicate prevention, and automated trigger support.
 
-This project automates the processing of GR (Goods Receipt) templates from a Drive folder, extracting data into consolidated sheets with automatic enrichment (PLA lookup, currency conversion, territory mapping).
+---
 
-**Features:**
-- Batch conversion of Excel files to Google Sheets
-- Intelligent header detection and column mapping (with aliases)
-- Advanced row filtering (skips summaries, merged cells, hidden rows)
-- PLA-based enrichment (Regional Area, Site Name, Territory)
-- Automatic currency conversion (PHP/EUR → USD)
-- Complete audit trail (Processed Files Log)
-- One-minute automatic processing (time-based triggers)
-- Idempotent processing (duplicate prevention)
-- Performance monitoring (conversion/parse/append timing)
-- Backfill & repair tools (source links, enrichment, USD recalculation)
-- Comprehensive admin/debug tools
+## Why this exists
 
-## Quick Start
+The project is intended to make GR consolidation more robust and maintainable.
 
-### Installation (5 minutes)
+- A modular codebase replaces a single monolithic Apps Script file.
+- Safer, repeatable runs are enforced through limits designed to avoid timeouts.
+- Data enrichment is enabled through PLA lookup tables and currency conversion.
+- A clear audit trail is maintained for processed files.
 
-1. **Open your main consolidation spreadsheet** in Google Sheets
+---
 
-2. **Paste the script:**
-   - Click **Extensions** → **Apps Script**
-   - Delete any existing code
-   - Copy-paste the full content of `scripts/gs-script-v11.gs`
-   - Click **Save**
+## Core workflow
 
-3. **Enable Drive API:**
-   - In Apps Script, click **Project Settings** (gear icon)
-   - Find "Google Cloud Platform (GCP) Project" and click the project link
-   - Go to **APIs & Services** → **Library**
-   - Search and enable **Google Drive API**
-   - Return to Apps Script
+The process is organized into a straightforward pipeline:
 
-4. **Run the authorization:**
-   - In Apps Script, click **Run** (play icon) at top
-   - Grant permissions when prompted
-
-5. **Test the menu:**
-   - Refresh your spreadsheet
-   - You should see **GR Automation** menu at the top
-   - Installation complete!
-
-6. **Run first consolidation:**
-   - Click **GR Automation** → **Processing** → **Process All New Files Now**
-   - Check **Processed Files Log** sheet for results in 1-2 minutes
-
-## Documentation
-
-This project includes comprehensive documentation at multiple levels:
-
-### For End Users (Non-Technical)
-**[USER_MANUAL_GR_CONSOLIDATION.md](./docs/USER_MANUAL_GR_CONSOLIDATION.md)** (80+ pages)
-
-Complete step-by-step guide including:
-- Installation & permissions setup
-- Configuration explained
-- First run walkthrough
-- Menu walkthrough (every button, click-by-click)
-- Working with the Processed Files Log
-- Using backfill & repair tools
-- Setting up automation
-- Dashboard overview
-- Troubleshooting common issues
-- Maintenance & cleanup
-- Technical overview of how it works
-- Function reference & glossary
-
-**Start here** if you're new to the system!
-
-### For Developers (Technical)
-**[ANNOTATED_CODE_GUIDE.md](./docs/ANNOTATED_CODE_GUIDE.md)** (50+ pages)
-
-In-depth technical documentation including:
-- Code organization & structure
-- Configuration & constants
-- Architecture diagrams
-- Major code sections with pseudocode
-- Complete data flow walkthrough (example)
-- Caching & performance strategies
-- Error handling patterns
-- Testing & debugging approaches
-- Future improvement suggestions
-- Quick reference
-
-**Start here** if you need to understand or modify the code!
-
-# GR Template Automation Consolidator
-
-Lightweight portfolio summary for the consolidation project.
-
-Summary
-
-- Purpose: Consolidate GR (Goods Receipt) Excel templates from a Drive folder into Google Sheets.
-- Implementation: Google Apps Script split into modular files under the `main-scripts/` folder.
-- Sync: Configured for `clasp` with `main-scripts` as the local root; manifest preserved in `main-scripts/appsscript.json`.
-
-Key files
-
-- main-scripts/1_Config_And_Menu.gs
-- main-scripts/2_Main_Triggers.gs
-- main-scripts/3_Drive_And_Parsing.gs
-- main-scripts/4_Tracker_And_Sheets.gs
-- backups/ (legacy single-file scripts kept for reference)
-
-Quick notes for developers
-
-- To work locally: run
-
-```powershell
-npm install
-npx @google/clasp login
-npx @google/clasp push
+```text
+Drive Source Files
+      ↓
+Convert to Temp Google Sheets
+      ↓
+Parse sheets and detect headers
+      ↓
+Filter, normalize, enrich rows
+      ↓
+Append to year-based output sheets
+      ↓
+Log processing in Processed Files Log
 ```
 
-- `main-scripts/` is the `clasp` root; push/pull will sync with the Apps Script project.
-- Recent change (2026-06-03): added an early-exit optimization to skip incremental scanning when no new/modified source files are detected.
+The same flow with the main purpose of each stage:
 
-If you want me to run the `clasp` push or open the Apps Script project, tell me and I will continue.
+| Stage | Purpose |
+| --- | --- |
+| Source | Discover Excel/Spreadsheet templates in Drive |
+| Convert | Convert files into temporary Google Sheets |
+| Parse | Identify the correct sheet/tab and extract row data |
+| Enrich | Lookup PLA metadata, territory, and convert USD |
+| Output | Append rows to the correct `GR Posted YYYY` sheet |
+| Track | Save status and duplicate checks in `Processed Files Log` |
+
+---
+
+## What is included
+
+| Area | What is implemented |
+| --- | --- |
+| File discovery | Drive scanning with year detection and file filtering |
+| Conversion | Excel → Sheets conversion using Drive advanced service |
+| Parsing | Header detection, alias matching, summary/footer filtering |
+| Enrichment | PLA lookup, territory mapping, USD conversion |
+| Output | Year-based output sheets plus hyperlink source tracking |
+| Tracking | Processed files log, failed attempt handling, dedupe checks |
+| Automation | Time-based triggers and status diagnostics |
+| Local development | `clasp` support with `main-scripts/` project layout |
+
+---
+
+## Active repository files
+
+| File / Folder | Purpose |
+| --- | --- |
+| `main-scripts/1_Config_And_Menu.gs` | Configuration, menu building, auto-trigger controls |
+| `main-scripts/2_Main_Triggers.gs` | Consolidation orchestration and entry points |
+| `main-scripts/3_Drive_And_Parsing.gs` | Drive file discovery, conversion, parsing logic |
+| `main-scripts/4_Tracker_And_Sheets.gs` | Output sheet writing, tracker logging, duplicate prevention |
+| `main-scripts/appsscript.json` | Apps Script manifest, Drive advanced service settings |
+| `backups/` | Legacy script versions for reference and rollback |
+| `docs/` | Supporting documentation, user manual, annotated code guide |
+| `package.json` | Local tooling and `clasp` script commands |
+
+---
+
+## Local workflow
+
+Use `clasp` to sync changes and keep the Apps Script project aligned.
+
+```bash
+npm run clasp:login
+npm run clasp:push
+npm run clasp:pull
+npm run clasp:status
+```
+
+The local source is stored in `main-scripts/` and syncs with the bound Apps Script project using `clasp`.
+
+---
+
+## Important technical details
+
+- The Drive advanced service (`Drive.Files`) is used for faster conversion and file discovery than the Spreadsheet UI alone.
+- Runtime safeguards are included: file count limits, per-year limits, size checks, and skipped files after repeated failures.
+- Output tracking is preserved by recording each processed file in `Processed Files Log` and checking multiple duplicate keys.
+- A separate `PLA Lookup` sheet allows enrichment rules to be updated without modifying parsing logic.
+
+---
+
+## Documentation and visuals
+
+Supporting documentation is included to explain the system in detail:
+
+- `docs/GETTING_STARTED.md` — onboarding guide and architecture references
+- `docs/ANNOTATED_CODE_GUIDE.md` — detailed code walk-through and architecture diagram
+- `docs/USER_MANUAL_GR_CONSOLIDATION.md` — user-facing manual for running the automation
+- `docs/SCRIPT_REFERENCE.csv` — function-level reference and feature mapping
+
+Menu screenshots are preserved in `docs/img/`.
+
+---
+
+## How to read this repo
+
+1. Start with `docs/GETTING_STARTED.md` for the overall architecture.
+2. Use `docs/ANNOTATED_CODE_GUIDE.md` for the internal flow and implementation details.
+3. Refer to `docs/USER_MANUAL_GR_CONSOLIDATION.md` for end-user instructions.
+4. Search `docs/SCRIPT_REFERENCE.csv` for function-specific behavior.
+
+---
+
+## License
+
+All rights reserved.
+
+

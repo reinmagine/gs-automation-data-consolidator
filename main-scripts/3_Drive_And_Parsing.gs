@@ -1,4 +1,6 @@
+// DRIVE AND PARSING
 // Everything related to fetching files, checking permissions, and extracting data from sheets.
+
 // Find and list files
 function findFolder_(name) {
   const iter = DriveApp.getFoldersByName(name);
@@ -189,105 +191,163 @@ function detectYearFromNameOrFileDate_(file) {
   return getConfiguredYearFromDate_(secondaryDate, yearsSet);
 }
 
-function listSourceFilesFull_(sourceFolder) {
-  const out = [];
-  if (!sourceFolder) return out;
-  const maxInspect = Math.max(0, Number(CONFIG.fullScanMaxFilesToInspect) || 0);
-  const files = sourceFolder.getFiles();
+// 🚀 INDESTRUCTIBLE WRAPPER: Handles API v3, v2, and Native DriveApp without crashing
+function fetchDriveFilesWrapper_(folderId, sinceDate, maxLimit) {
+  const allFiles = [];
+  let success = false;
 
-  while (files.hasNext()) {
-    const f = files.next();
-    out.push({
-      id: getFileIdSafe_(f),
-      name: getFileNameSafe_(f),
-      url: getFileUrlSafe_(f),
-      createdDate: getFileDateCreatedSafe_(f),
-      modifiedDate: getFileLastUpdatedSafe_(f),
-    });
-    if (maxInspect > 0 && out.length >= maxInspect) break;
+  if (typeof Drive !== "undefined" && Drive && Drive.Files) {
+    let v3Query = "'" + folderId + "' in parents and trashed = false";
+    let v2Query = v3Query;
+
+    if (sinceDate instanceof Date && !isNaN(sinceDate.getTime())) {
+      const dateString = Utilities.formatDate(
+        sinceDate,
+        "GMT",
+        "yyyy-MM-dd'T'HH:mm:ss'Z'",
+      );
+      v3Query += " and modifiedTime >= '" + dateString + "'";
+      v2Query += " and modifiedDate >= '" + dateString + "'";
+    }
+
+    let pageToken = null;
+    let useV3 = true;
+
+    do {
+      let resp;
+      if (useV3) {
+        try {
+          const params = {
+            q: v3Query,
+            pageSize: 1000,
+            supportsAllDrives: true,
+            includeItemsFromAllDrives: true,
+            fields:
+              "nextPageToken, files(id, name, modifiedTime, createdTime, webViewLink, alternateLink)",
+          };
+          if (pageToken) params.pageToken = pageToken;
+          resp = Drive.Files.list(params); // Intentionally omitted orderBy to prevent Shared Drive bug
+          const items = resp.files || [];
+          for (let i = 0; i < items.length; i++) {
+            allFiles.push(normalizeDriveApiFileItem_(items[i]));
+            if (maxLimit && allFiles.length >= maxLimit) return allFiles;
+          }
+          pageToken = resp.nextPageToken;
+          success = true;
+        } catch (e) {
+          useV3 = false;
+          pageToken = null;
+          allFiles.length = 0;
+        }
+      }
+
+      if (!useV3 && !success) {
+        try {
+          const params = {
+            q: v2Query,
+            maxResults: 1000,
+            supportsAllDrives: true,
+            includeItemsFromAllDrives: true,
+          };
+          if (pageToken) params.pageToken = pageToken;
+          resp = Drive.Files.list(params); // Intentionally omitted orderBy to prevent Shared Drive bug
+          const items = resp.items || [];
+          for (let i = 0; i < items.length; i++) {
+            allFiles.push(normalizeDriveApiFileItem_(items[i]));
+            if (maxLimit && allFiles.length >= maxLimit) return allFiles;
+          }
+          pageToken = resp.nextPageToken;
+          success = true;
+        } catch (e2) {
+          success = false;
+          break; // Break loop to force native fallback
+        }
+      }
+    } while (pageToken);
+
+    if (success)
+      return allFiles.filter(function (f) {
+        return f && f.id;
+      });
   }
-  return out;
+
+  // Native DriveApp Fallback
+  Logger.log("Drive API failed. Falling back to native fast-search.");
+  try {
+    const folder = DriveApp.getFolderById(folderId);
+    let query = "trashed = false";
+    if (sinceDate instanceof Date && !isNaN(sinceDate.getTime())) {
+      const dateString = Utilities.formatDate(
+        sinceDate,
+        "GMT",
+        "yyyy-MM-dd'T'HH:mm:ss'Z'",
+      );
+      query += " and modifiedDate >= '" + dateString + "'";
+    }
+    const files = folder.searchFiles(query);
+    while (files.hasNext()) {
+      const f = files.next();
+      allFiles.push({
+        id: f.getId(),
+        name: f.getName(),
+        url: f.getUrl(),
+        createdDate: f.getDateCreated(),
+        modifiedDate: f.getLastUpdated(),
+      });
+      if (maxLimit && allFiles.length >= maxLimit) break;
+    }
+  } catch (e3) {
+    Logger.log("Native DriveApp fallback failed: " + e3.message);
+  }
+
+  return allFiles;
+}
+
+function listSourceFilesFull_(sourceFolder) {
+  if (!sourceFolder) return [];
+  const maxInspect = Math.max(0, Number(CONFIG.fullScanMaxFilesToInspect) || 0);
+  const limit = maxInspect > 0 ? maxInspect : null;
+  const files = fetchDriveFilesWrapper_(sourceFolder.getId(), null, limit);
+
+  // Sort in memory to bypass Google API sorting bugs
+  files.sort(function (a, b) {
+    const tA = a.modifiedDate ? a.modifiedDate.getTime() : 0;
+    const tB = b.modifiedDate ? b.modifiedDate.getTime() : 0;
+    return tB - tA;
+  });
+  return files;
+}
+
+function listSourceFilesIncremental_(sourceFolder, sinceDate) {
+  if (!sourceFolder) return [];
+  const maxInspect = Math.max(
+    1,
+    Number(CONFIG.incrementalScanMaxFilesToInspect) || 2000,
+  );
+  const files = fetchDriveFilesWrapper_(
+    sourceFolder.getId(),
+    sinceDate,
+    maxInspect,
+  );
+
+  // Sort in memory to bypass Google API sorting bugs
+  files.sort(function (a, b) {
+    const tA = a.modifiedDate ? a.modifiedDate.getTime() : 0;
+    const tB = b.modifiedDate ? b.modifiedDate.getTime() : 0;
+    return tB - tA;
+  });
+  return files;
 }
 
 function hasSourceChanged_(sourceFolder, sinceDate) {
   if (!sourceFolder) return true;
   try {
-    if (typeof Drive !== "undefined" && Drive && Drive.Files) {
-      const folderId = sourceFolder.getId();
-      if (!(sinceDate instanceof Date) || isNaN(sinceDate.getTime())) return true;
-      const qParts = ["'" + folderId + "' in parents", "trashed = false"];
-      qParts.push("modifiedTime >= '" + sinceDate.toISOString() + "'");
-      const query = qParts.join(" and ");
-      const resp = Drive.Files.list({
-        q: query,
-        maxResults: 1,
-        pageSize: 1,
-        orderBy: "modifiedTime desc",
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-        fields: "items(id,title,modifiedDate,modifiedTime),files(id,name,modifiedTime),nextPageToken",
-      });
-      const items = (resp && (resp.items || resp.files)) ? (resp.items || resp.files) : [];
-      return items.length > 0;
-    } else {
-      const files = sourceFolder.getFiles();
-      while (files.hasNext()) {
-        const f = files.next();
-        const last = getFileLastUpdatedSafe_(f);
-        if (last && sinceDate instanceof Date && last.getTime() >= sinceDate.getTime())
-          return true;
-      }
-      return false;
-    }
+    const files = fetchDriveFilesWrapper_(sourceFolder.getId(), sinceDate, 1);
+    return files.length > 0;
   } catch (e) {
-    return true;
+    Logger.log("hasSourceChanged_ error: " + e.message);
+    return true; // Fail safe
   }
-}
-
-function listSourceFilesIncremental_(sourceFolder, sinceDate) {
-  const out = [];
-  if (!sourceFolder) return out;
-
-  const folderId = sourceFolder.getId();
-  const pageSize = Math.max(
-    50,
-    Math.min(1000, Number(CONFIG.incrementalScanPageSize) || 250),
-  );
-  const maxInspect = Math.max(
-    1,
-    Number(CONFIG.incrementalScanMaxFilesToInspect) || 2000,
-  );
-
-  const qParts = ["'" + folderId + "' in parents", "trashed = false"];
-  if (sinceDate instanceof Date && !isNaN(sinceDate.getTime())) {
-    qParts.push("modifiedTime >= '" + sinceDate.toISOString() + "'");
-  }
-  const query = qParts.join(" and ");
-
-  let pageToken = null;
-  do {
-    const resp = Drive.Files.list({
-      q: query,
-      maxResults: pageSize,
-      pageToken: pageToken,
-      orderBy: "modifiedTime desc",
-      supportsAllDrives: true,
-      includeItemsFromAllDrives: true,
-      fields:
-        "items(id,title,modifiedDate,modifiedTime,createdDate,alternateLink,webViewLink),files(id,name,modifiedTime),nextPageToken",
-    });
-    const items = resp && resp.items ? resp.items : [];
-    for (let i = 0; i < items.length; i++) {
-      const normalized = normalizeDriveApiFileItem_(items[i]);
-      if (!normalized || !normalized.id || !normalized.name) continue;
-      out.push(normalized);
-      if (out.length >= maxInspect) break;
-    }
-    if (out.length >= maxInspect) break;
-    pageToken = resp && resp.nextPageToken ? resp.nextPageToken : null;
-  } while (pageToken);
-
-  return out;
 }
 
 function listSourceFilesForScan_(sourceFolder, scriptProps, options) {
