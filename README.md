@@ -1,12 +1,14 @@
-# GR Template Automation Consolidator
+# GR Template Data Automation Consolidator
 
 This repository is designed to manage GR Excel templates across Google Drive and consolidate them into a unified Google Sheets workflow. The code is structured for local development using `clasp`, while preserving the Apps Script behavior that executes inside Google Sheets.
 
+**Script Version:** 11 | **Date Updated:** June 7, 2026
+
 ---
 
-## What this project does
+## Summary
 
-The system is built to reliably perform three core tasks:
+This solution is designed to perform three core tasks reliably:
 
 1. Detect new GR template files in a Drive folder.
 2. Convert and parse them without manual cleanup.
@@ -16,9 +18,9 @@ This is a working automation pipeline with tracker logging, duplicate prevention
 
 ---
 
-## Why this exists
+## Design Intent
 
-The project is intended to make GR consolidation more robust and maintainable.
+This project was developed to make GR consolidation more maintainable into a data pipeline.
 
 - A modular codebase replaces a single monolithic Apps Script file.
 - Safer, repeatable runs are enforced through limits designed to avoid timeouts.
@@ -27,9 +29,9 @@ The project is intended to make GR consolidation more robust and maintainable.
 
 ---
 
-## Core workflow
+## Solution Architecture
 
-The process is organized into a straightforward pipeline:
+The process is organized into a structured pipeline:
 
 ```text
 Drive Source Files
@@ -58,7 +60,7 @@ The same flow with the main purpose of each stage:
 
 ---
 
-## What is included
+## Features & Capabilities
 
 | Area | What is implemented |
 | --- | --- |
@@ -73,7 +75,7 @@ The same flow with the main purpose of each stage:
 
 ---
 
-## Active repository files
+## Repository Contents
 
 | File / Folder | Purpose |
 | --- | --- |
@@ -88,9 +90,9 @@ The same flow with the main purpose of each stage:
 
 ---
 
-## Local workflow
+## Development Workflow
 
-Use `clasp` to sync changes and keep the Apps Script project aligned.
+Use `clasp` to synchronize changes and keep the Apps Script project aligned.
 
 ```bash
 npm run clasp:login
@@ -103,7 +105,7 @@ The local source is stored in `main-scripts/` and syncs with the bound Apps Scri
 
 ---
 
-## Important technical details
+## Highlights
 
 - The Drive advanced service (`Drive.Files`) is used for faster conversion and file discovery than the Spreadsheet UI alone.
 - Runtime safeguards are included: file count limits, per-year limits, size checks, and skipped files after repeated failures.
@@ -112,7 +114,7 @@ The local source is stored in `main-scripts/` and syncs with the bound Apps Scri
 
 ---
 
-## Documentation and visuals
+## Supporting Documentation
 
 Supporting documentation is included to explain the system in detail:
 
@@ -123,9 +125,21 @@ Supporting documentation is included to explain the system in detail:
 
 Menu screenshots are preserved in `docs/img/`.
 
+### Visual Overview
+
+![1 Processing](docs/img/1-processing.png)
+
+![2 GR Posted Sheets](docs/img/2-gr-posted-sheets.png)
+
+![3 Tracker Logs](docs/img/3-tracker-logs.png)
+
+![4 Automation](docs/img/4-automation.png)
+
+![5 Admin](docs/img/5-admin.png)
+
 ---
 
-## How to read this repo
+## Recommended Reading
 
 1. Start with `docs/GETTING_STARTED.md` for the overall architecture.
 2. Use `docs/ANNOTATED_CODE_GUIDE.md` for the internal flow and implementation details.
